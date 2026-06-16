@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title><!-- HOSTNAME --> — Server Splash</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #1a1b26; color: #a9b1d6; padding: 3rem 2rem; }
+  h1 { font-size: 2.4rem; color: #c0caf5; margin-bottom: .25rem; letter-spacing: -.02em; }
+  .subtitle { color: #565f89; margin-bottom: 3rem; font-size: .95rem; }
+  h2 { color: #7aa2f7; font-size: 1.1rem; text-transform: uppercase; letter-spacing: .08em; margin: 2.5rem 0 1rem; border-bottom: 1px solid #292e42; padding-bottom: .5rem; }
+  a { color: #9ece6a; text-decoration: none; transition: color .15s, background-color .15s; }
+  a:hover { color: #b9f27c; }
+
+  /* GPU section */
+  .gpu-section { margin: 1rem 0 2.5rem; }
+  .gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .65rem; }
+  .gpu-card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: .85rem 1.1rem; transition: border-color .15s; }
+  .gpu-card:hover { border-color: #7aa2f7; }
+  .gpu-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .45rem; color: #c0caf5; font-weight: 600; font-size: .88rem; }
+  .gpu-icon { font-size: 1.25rem; }
+  .gpu-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: .35rem; margin-top: .5rem; }
+  .gpu-metric { background: #16161ef0; padding: .35rem .55rem; border-radius: 4px; font-size: .72rem; color: #7aa2f7; }
+  .gpu-label { color: #565f89; margin-right: .25rem; }
+
+  /* health states */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: .75rem; }
+  .card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: 1rem 1.25rem; display: flex; align-items: center; gap: .6rem; transition: border-color .15s, background-color .3s; position: relative; }
+  .card:hover { border-color: #7aa2f7; cursor: pointer; }
+  .card.status-up   { border-color: #9ece6a; animation: none; }
+  .card.status-down { border-color: #ff6e6e; background: linear-gradient(135deg, #3b1515 0%, #1e2030 40%); cursor: default; }
+
+  @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+  .status-icon { font-size: .7rem; width: auto; height: auto; text-align: center; flex-shrink: 0; transition: color .3s; position: absolute; top: .65rem; right: .75rem; }
+  .card.status-unknown .status-icon { color: #565f89; }
+  .card.status-down .status-icon { color: #ff6e6e; animation: pulse-red 2s infinite; }
+  .card.status-up .status-icon { color: #9ece6a; }
+
+  .icon { font-size: 1.6rem; display: inline-flex; align-items: center; flex-shrink: 0; }
+  .info { flex: 1; min-width: 0; }
+  .name { color: #c0caf5; font-weight: 600; font-size: .95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .desc { color: #565f89; font-size: .78rem; margin-top: .15rem; }
+
+  /* links modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.4); backdrop-filter: blur(4px); align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex !important; }
+  .modal-box { width: min(780px, 92vw); max-height: 70vh; background: #1e2030; border: 1px solid #414868; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+  .modal-header { display: flex; align-items: center; justify-content: space-between; padding: .75rem 1rem; background: #292e42; border-bottom: 1px solid #414868; }
+  .modal-title { color: #c0caf5; font-weight: 600; font-size: .95rem; }
+  .modal-close { background: none; border: none; color: #7aa2f7; cursor: pointer; font-size: 1.1rem; padding: 0 .25rem; line-height: 1; transition: color .15s; }
+  .modal-close:hover { color: #b9f6a7; }
+  .modal-body { overflow-y: auto; flex: 1; font-family: monospace; font-size: .72rem; line-height: 1.45; background: #0d0d15; padding: .75rem; color: #9ece6a; }
+  .modal-body::-webkit-scrollbar { width: 6px; }
+  .modal-body::-webkit-scrollbar-track { background: transparent; }
+  .modal-body::-webkit-scrollbar-thumb { background: #3d425a; border-radius: 3px; }
+
+</style>
+<style>
+  .link-wrap { display: flex; align-items: center; gap: .4rem; flex-shrink: 0; text-align: right; }
+  .link { color: #7aa2f7; font-size: .75rem; white-space: nowrap; text-decoration: none; transition: color .15s; }
+  .link:hover { color: #b9f27c; }
+  .protocol { color: #565f89; margin-right: .25rem; font-weight: normal; }
+  footer { margin-top: 3rem; color: #3d425a; font-size: .72rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1><!-- HOSTNAME --></h1>
+<p class="subtitle">// quick-launch dashboard — services directory</p>
+
+<!-- GPU_STATS_PLACEHOLDER -->
+
+<h2>&#x2699;&#xFE0F; Host Services</h2>
+<div class="grid" id="host-grid">
+<!--GROUP_HOST_SERVICES-->
+</div>
+
+<h2>&#x1F3E1;&#xFE0F; Remote &amp; Guest VMs</h2>
+<div class="grid" id="remote-grid">
+<!--GROUP_REMOTE_GUEST_VMS-->
+</div>
+
+<!-- LOGS MODAL -->
+<div class="modal-overlay" id="logs-modal-overlay" onclick="closeModal()">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <span class="modal-title" id="modal-service">Service Logs</span>
+      <button class="modal-close" onclick="closeModal()">&#x2715;</button>
+    </div>
+    <div class="modal-body" id="modal-body">Loading...</div>
+  </div>
+</div>
+
+<script>
+// GPU Stats from Glances API
+function renderGPUs() {
+  var container = document.getElementById('gpu-list');
+  if (!container) return;
+  fetch('<!-- GLANCES_URL -->/api/4/gpu')
+    .then(function(r) { return r.json(); })
+    .then(function(gpuData) {
+      if (!Array.isArray(gpuData) || gpuData.length === 0) {
+        container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
+        return;
+      }
+      var html = '';
+      for (var i = 0; i < gpuData.length; i++) {
+        var gpu = gpuData[i];
+        if (gpu && gpu.key == 'gpu_id') {
+          var name = gpu.name ? gpu.name.replace(/ /g, '&lt;wbr&gt;') : 'GPU';
+          var memPct = Math.round((gpu.mem || 0));
+          var proc = gpu.proc != null ? gpu.proc : '-';
+          var temp = gpu.temperature != null ? gpu.temperature + '\u00B0C' : '-';
+          var fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '\u2014';
+
+          var loadColor = '#9ece6a';
+          if (memPct > 80) loadColor = '#ff6e6a';
+          else if (memPct > 40) loadColor = '#e5f07a';
+
+          html += '<div class="gpu-card">' +
+            '<div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> ' + name + '</div>' +
+            '<strong style="color:' + loadColor + ';font-size:1.55rem;">' + memPct + '<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>' +
+            '<div class="gpu-metrics">' +
+              '<div class="gpu-metric"><span class="gpu-label">Compute:</span>' + proc + '%</div>' +
+              '<div class="gpu-metric"><span class="gpu-label">Temp:</span>' + temp + '</div>' +
+              '<div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>' + fan + '</div>' +
+            '</div></div>';
+        }
+      }
+      container.innerHTML = html;
+    })
+    .catch(function() {
+      if (!container.querySelector('h3')) {
+        container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
+      }
+    });
+}
+
+renderGPUs();
+setInterval(renderGPUs, 3000);
+
+// OpenService: click any card → open that URL
+function openService(el) {
+  var link = el.querySelector('.link');
+  if (!link) return;
+  var url = link.getAttribute('href') || '';
+  window.location.href = url;
+}
+
+// Logs Modal
+function fetchLogs(serviceName) {
+  var overlay = document.getElementById('logs-modal-overlay');
+  var titleEl = document.getElementById('modal-service');
+  var bodyEl = document.getElementById('modal-body');
+
+  titleEl.textContent = serviceName + ' logs';
+  bodyEl.innerHTML = '<span style="color:#7aa2f7;">Fetching...</span>';
+  overlay.classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('logs-modal-overlay').classList.remove('open');
+}
+
+// Probe status updates
+(function() {
+  var cards = document.querySelectorAll('.card[data-probe]');
+  cards.forEach(function(card) {
+    var probeUrl = card.getAttribute('data-probe');
+    var icon = card.querySelector('.status-icon');
+
+    // Try with CORS proxy for cross-origin health checks
+    fetch(probeUrl, { mode: 'no-cors' })
+      .then(function() {
+        if (icon) icon.innerHTML = '&#x1F7E2;';
+        card.classList.remove('status-unknown', 'status-down');
+        card.classList.add('status-up');
+      })
+      .catch(function() {
+        if (icon) { /* keep default or set down */ }
+      });
+
+    // Click handler for cards with links
+    if (probeUrl && !card.hasAttribute('data-clicked')) {
+      card.setAttribute('data-clicked', '1');
+      card.addEventListener('click', function(e) {
+        var linkEl = card.querySelector('.link');
+        if (linkEl && linkEl.getAttribute('href')) {
+          e.preventDefault();
+          window.location.href = linkEl.getAttribute('href');
+        }
+      });
+    }
+  });
+})();
+</script>
+<footer><!-- FOOTER --></footer>
+</body>
+</html>
