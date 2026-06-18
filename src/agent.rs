@@ -1,33 +1,61 @@
+/// Normalize an endpoint URL so that 127.0.0.1 and localhost resolve to the same key.
+fn normalize_key(url: &str) -> Option<String> {
+    // Strip http:// or https:// prefix, extract host:port
+    let stripped = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    Some(stripped.to_lowercase()) // host:port as canonical key
+}
+
 /// Probe common OpenAI-compatible endpoints on localhost/loopback.
 pub(crate) fn probe_agent_endpoints() -> Vec<String> {
     let ports = [11434, 8000, 5555, 7777, 8080, 9000, 1234];
-    let mut found = Vec::new();
+    let mut found: Vec<(String, String)> = Vec::new(); // (canonical_key, original_url)
 
     for port in ports {
         let addr = format!("http://127.0.0.1:{port}");
-        match reqwest::blocking::get(format!("{addr}/api/tags")) {
-            Ok(resp) if resp.status() == 200 => found.push(addr),
-            _ => {}
+        if let Ok(resp) = reqwest::blocking::get(format!("{addr}/api/tags")) {
+            if resp.status() == 200 {
+                if let Some(key) = normalize_key(&addr) {
+                    // Only add if no other URL with the same port already exists
+                    if !found.iter().any(|(k, _)| k == &key) {
+                        found.push((key, addr));
+                    }
+                }
+            }
         }
     }
 
     // Also check env var
     if let Ok(url) = std::env::var("OLLAMA_HOST") {
         let trimmed = url.trim().to_string();
-        if !found.iter().any(|u| u == &trimmed) && is_openai_compatible(&trimmed) {
-            found.push(trimmed);
+        if is_openai_compatible(&trimmed) && !found.iter().any(|(_, u)| *u == trimmed) {
+            if let Some(key) = normalize_key(&trimmed) {
+                if !found.iter().any(|(k, _)| k == &key) {
+                    found.push((key, trimmed));
+                }
+            } else {
+                found.push((trimmed.clone(), trimmed));
+            }
         }
     }
 
-    // Check http://localhost:port too
+    // Check http://localhost:port too, but dedup by port against 127.0.0.1:port
     for port in ports {
         let addr = format!("http://localhost:{port}");
-        if !found.contains(&addr) && is_openai_compatible(&addr) {
-            found.push(addr);
+        if is_openai_compatible(&addr) {
+            let key = format!("localhost:{port}");
+            // Only add if no 127.0.0.1:port variant already found
+            let existing = found.iter().any(|(k, _)| k == &key);
+            let conflict = format!("127.0.0.1:{port}");
+            let no_conflict_for_localhost = !found.iter().any(|(_k, u)| {
+                *u == format!("http://127.0.0.1:{port}") && normalize_key(u).as_deref() == Some(&conflict.to_lowercase())
+            });
+            if !existing && no_conflict_for_localhost {
+                found.push((key, addr));
+            }
         }
     }
 
-    found
+    found.into_iter().map(|(_, url)| url).collect()
 }
 
 /// Ask the agent API "list models" to verify it's an OpenAI-compatible endpoint.
@@ -95,64 +123,44 @@ pub(crate) fn get_models(base_url: &str) -> anyhow::Result<Vec<String>> {
     Ok(models)
 }
 
-/// Send system command output to an AI agent for service analysis, returning the parsed JSON response.
-#[allow(dead_code)]
-pub(crate) fn analyze_services(
-    base_url: &str,
-    commands: &[String],
-    prompt: &str,
-) -> anyhow::Result<String> {
+/// Get the currently loaded model from Ollama.
+/// /api/ps returns models actively resident in VRAM.
+pub(crate) fn get_default_model(base_url: &str) -> Option<String> {
     use reqwest::blocking::Client;
     let client = Client::new();
 
-    // Discover first available model so we can set one (empty string is rejected by some APIs)
-
-    let system_prompt = r#"You are a system analyst. The user will provide you with raw output from Linux commands (systemctl list-units, systemctl --user list-units, docker ps, etc.). 
-
-Your task: Return a compact JSON array of services that would be interesting to display on a server dashboard page. Only include real services — NOT the agent itself and not analysis metadata.
-
-Each entry in the array must have exactly these fields:
-- "name": human-readable service name (e.g., "Ollama")
-- "desc": brief description (5–12 words) 
-- "icon": a single emoji suited to the service
-- "protocol": http, https, ssh, vnc, mqtt, websocket, etc.
-- "port": server port number as string, or null if daemon-only
-- "host_override": optional hostname override as string (null to infer from user's input)
-- "base_path": optional URL path (null for root)
-- "group": categorize into one of: ["Host Services", "Remote & Guest", "Monitoring", "Development", "Storage & Sharing"]
-- "web_probe_url": URL to HTTP health-check probe (null if daemon-only, n/a, or SSH/VNC/etc.)
-
-Rules:
-1. ONLY include services with visible UIs, web endpoints, SSH access, VNC, MQTT, etc.
-2. Daemon-only services without any UI go in the output but set port=null and a brief note about their purpose.
-3. Do NOT invent ports, protocols, or hostnames.
-4. Include GPU/VRAM info if the machine has GPUs and monitoring exists (like Glances).
-5. Be concise — 8–20 services max unless there's genuinely more interesting ones.
-6. If Docker containers are active, include relevant exposed services but mark them as "via Docker".
-
-Return ONLY valid JSON — no markdown fences, no explanation text."#;
-
-    let resp = client.post(format!("{base_url}/v1/chat/completions"))
-        .json(&serde_json::json!({
-            "model": "",  // will be filled if known
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": format!(
-                    "Analyze these service outputs and return a JSON array of interesting services.\n\nHost: {}\nMachine Info:\n{}\n\nServices:\n{}",
-                    prompt,
-                    commands.first().map(|s| s.as_str()).unwrap_or(""),
-                    if commands.len() > 1 { commands[1..].join("\n") } else { String::new() }
-                )},
-            ],
-            "temperature": 0.2,
-        }))
-        .send()?;
-    
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text()?;
-        return Err(anyhow::anyhow!("API error: {}\n{}", status, body));
+    // Ollama /api/ps - currently loaded models
+    if let Ok(resp) = client.get(format!("{base_url}/api/ps")).send() {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>() {
+                if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+                    for m in arr {
+                        if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
-    let body: serde_json::Value = resp.json()?;
-    Ok(body["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+
+    // Fallback: first model from tags endpoint
+    if let Ok(resp) = client.get(format!("{base_url}/api/tags")).send() {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>() {
+                if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+                    if let Some(first) = arr.first() {
+                        if let Some(name) = first.get("name").and_then(|v| v.as_str()) {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
+
+
+

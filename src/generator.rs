@@ -1,13 +1,16 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs;
 use crate::wizard::{SplashService, WizardOutput};
 
-fn group_key(svc: &SplashService) -> &'static str {
+fn group_key(svc: &SplashService) -> Cow<'static, str> {
     let override_ = svc.host_override.as_deref().unwrap_or("");
     if !override_.is_empty() && override_ != "localhost" {
-        "Remote & Guest VMs"
-    } else {
-        "Host Services"
+        return Cow::Borrowed("Remote & Guest VMs");
+    }
+    match svc.group.as_str() {
+        "Monitoring" | "Development" | "Storage & Sharing" | "Infrastructure" => Cow::Owned(svc.group.clone()),
+        _ => Cow::Borrowed("Host Services"),
     }
 }
 
@@ -33,8 +36,8 @@ fn esc(s: &str) -> Cow<'_, str> {
 }
 
 fn card_class(svc: &SplashService) -> &'static str {
-    if svc.protocol.is_empty() || svc.protocol.to_lowercase().starts_with("http") {
-        "status-unknown"
+    if svc.port.is_none() || svc.protocol.is_empty() {
+        "status-down"
     } else {
         "status-up"
     }
@@ -46,12 +49,8 @@ fn render_right(svc: &SplashService) -> String {
         let proto = capitalize(&svc.protocol).to_lowercase();
         format!("<span class='protocol'>{proto}:</span>")
     } else {
-        // daemon-only: use lock icon + text
-        let s = String::from_utf8(vec![0xe2, 0x9a, 0xa2, 0x20, 0x64,
-                                        0x61, 0x65, 0x6d, 0x6f, 0x6e,
-                                        0x20, 0x6f, 0x6e, 0x6c, 0x79])
-            .unwrap();
-        format!("<span class='rd'>&#x1F512; {s}</span>")
+        let lock_text = String::from_utf8(vec![0xe2, 0x9a, 0xa2, 0x20, 0x64, 0x61, 0x65, 0x6d, 0x6f, 0x6e, 0x20, 0x6f, 0x6e, 0x6c, 0x79]).unwrap();
+        format!("<span class='rd'>&#x1F512; {lock_text}</span>")
     }
 }
 
@@ -69,10 +68,8 @@ fn card_href(svc: &SplashService, hostname: &str) -> String {
 
 fn click_handler(svc: &SplashService) -> Option<String> {
     if svc.protocol.to_lowercase().as_str() == "ssh" {
-        // Show logs modal for SSH cards
         Some(format!("logsmodal('SSH Server')"))
     } else if svc.port.is_some() {
-        // Open service in new tab for HTTP/other probes
         let href = card_href(svc, "");
         Some(format!("openservice('{}')", esc(&href)))
     } else {
@@ -101,131 +98,118 @@ fn render_card(svc: &SplashService, hostname: &str) -> String {
         let h = esc(&svc.host_override.as_deref().unwrap_or(hostname));
         let p = svc.port.as_ref().map(|x| x.as_str()).unwrap_or("");
         format!(r#"data-probe="http://{}:{}""#, esc(&h), esc(p))
-    } else {
-        String::new()
-    };
+    } else { String::new() };
 
     let right_html = render_right(svc);
-    
-    // Build onclick handler
-    let onclick = click_handler(svc)
-        .map(|handler| format!("onclick=\"{}\"", handler));
+    let onclick = click_handler(svc).map(|handler| format!("onclick=\"{}\"", handler));
+    let card_tag = if !href_val.is_empty() { "a" } else { "div" };
 
-    // Use the correct tag (a or div)
-    let tag = if href_val.is_empty() { "div" } else { "a" };
-
-    // Build card with status-icon positioned absolute (matching live site pattern)
     let mut c = String::new();
-    c.push('<');
-    c.push_str(tag);
-    c.push_str(" class=\"card ");
+    c.push_str("<");
+    c.push_str(card_tag);
+    c.push_str(" class=\"card service-card ");
     c.push_str(status_cls);
-    c.push_str("\"");
-    if !href_val.is_empty() { c.push_str(" "); c.push_str(&href_val); }
-    if !probe_attr.is_empty() { c.push_str(" "); c.push_str(&probe_attr); }
-    if let Some(ref onclick) = onclick { c.push_str(" "); c.push_str(onclick); }
+    c.push('"');
+    if !href_val.is_empty() { c.push(' '); c.push_str(&href_val); }
+    if !probe_attr.is_empty() { c.push(' '); c.push_str(&probe_attr); }
+    if let Some(ref onclick) = onclick { c.push(' '); c.push_str(onclick); }
     c.push('>');
 
-    // Status icon absolute top-right (&#128354; green circle for unknown)
-    c.push_str("<span class='status-icon'>&#x1F7E2;</span>");
-
-    // Icon
+    c.push_str("<span class='status-badge'></span>");
     c.push_str("<span class='icon'>");
     c.push_str(&icon);
     c.push_str("</span>");
-
-    // Info block (name + description)
     c.push_str("<div class='info'><span class='name'>");
     c.push_str(&name);
     c.push_str("</span><br><span class='desc'>");
     c.push_str(&desc);
     c.push_str("</span></div>");
 
-    // Right side (link-wrap with protocol)
-    if onclick.is_some() {
+    if !right_html.is_empty() {
         c.push_str("<div class='link-wrap'>");
         c.push_str(&right_html);
         c.push_str("</div>");
-    } else {
-        // Daemon-only cards: show the right_html directly
-        c.push('<');
-        c.push_str(tag);
-        c.push('>');
-        return c;
     }
-    c.push_str(" ");
 
-    let tag = if href_val.is_empty() { "div" } else { "a" };
+    c.push(' ');
     c.push_str("</");
-    c.push_str(tag);
+    c.push_str(card_tag);
     c.push('>');
-
     c
 }
 
 fn esc_short(s: &str) -> String {
-    let chars: Vec<char> = s.chars().take(40).collect();
-    let truncated: String = chars.into_iter().collect();
+    let truncated: String = s.chars().take(40).collect();
     esc(&truncated).into_owned()
 }
 
+/// For known groups (Host Services, Remote & Guest VMs) the template already
+/// provides `<h2>` and `<div class="grid">`, so we just return the cards.
+/// Custom groups get their own heading + grid wrapper.
 fn format_group_section(name: &str, svcs: &[&SplashService], hostname: &str) -> String {
+    let is_known = matches!(name, "Host Services" | "Remote & Guest VMs");
+
     let mut s = String::new();
-
-    match name {
-        "Host Services" => {
-            s.push_str("<h2>&#x2699;&#xFE0F; Host Services</h2>\n<div class=\"grid\">\n");
-        }
-        "Remote & Guest VMs" => {
-            s.push_str("<h2>&#x1F3E1;&#xFE0F; Remote &amp; Guest VMs</h2>\n<div class=\"grid\">\n");
-        }
-        other => {
-            let first = other.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?');
-            s.push_str("<h2>[");
-            s.push_str(&first.to_string());
-            s.push_str("] ");
-            s.push_str(esc(other).as_ref());
-            s.push_str("</h2>\n<div class=\"grid\">\n");
-        }
-    };
-
+    if !is_known {
+        let disp: String = format!("[{}] {}", &name[0..=0].to_uppercase(), &name[1..]);
+        s.push_str(&format!("<h2>{}</h2>\n<div class=\"grid\">\n", esc(&disp).into_owned()));
+    }
     for svc in svcs {
         s.push_str(&render_card(svc, hostname));
-        s.push('\n');
     }
-
-    s.push_str("</div>\n");
+    if !is_known {
+        s.push_str("</div>\n");
+    }
     s
 }
 
 pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     let mut html = include_str!("template.html").to_string();
 
-    // Step 1: Replace hostname in all three spots (title tag, h1, span id=page-title)
+    // Step 1: Replace hostnames in all three spots
     let hn = esc(&output.hostname).into_owned();
     for _ in 0..3 {
         html = html.replace("<!-- HOSTNAME -->", &hn);
     }
 
-    // Step 2: Build groups and substitute into template markers
-    let mut groups_by_type: Vec<(&'static str, Vec<&SplashService>)> = Vec::new();
+    // Step 1.5: Replace Glances API URL placeholder
+    let glances_url = output.glances_api_base.as_deref().unwrap_or("http://localhost:61208");
+    html = html.replace("<!-- GLANCES_URL -->", glances_url);
+
+    // Step 2: Group services, preserving insertion order (use BTreeMap for deterministic ordering)
+    let mut svc_grouped: BTreeMap<String, Vec<&SplashService>> = BTreeMap::new();
     for svc in &output.selected_services {
         let key = group_key(svc);
-        match groups_by_type.iter_mut().find(|(g, _)| *g == key) {
-            Some((_, svcs)) => svcs.push(svc),
-            None => groups_by_type.push((key, vec![svc])),
-        }
+        svc_grouped.entry(key.into()).or_default().push(svc);
     }
 
     let hostname = &output.hostname;
 
-    for (idx, (gname, svcs)) in groups_by_type.iter().enumerate() {
-        let section_html = format_group_section(gname, &svcs, hostname);
-        if idx == 0 {
-            html = html.replace("<!--GROUP_HOST_SERVICES-->", &section_html);
-        } else if idx == 1 {
-            html = html.replace("<!--GROUP_REMOTE_GUEST_VMS-->", &section_html);
+    // Place known groups into template markers, unknown groups appended before footer
+    let mut custom_sections = Vec::new();
+    for (gname, svcs) in &svc_grouped {
+        match gname.as_str() {
+            "Host Services" => {
+                if html.contains("<!--GROUP_HOST_SERVICES-->") {
+                    html = html.replace("<!--GROUP_HOST_SERVICES-->", &format_group_section(gname, svcs, hostname));
+                }
+            }
+            "Remote & Guest VMs" => {
+                if html.contains("<!--GROUP_REMOTE_GUEST_VMS-->") {
+                    html = html.replace("<!--GROUP_REMOTE_GUEST_VMS-->", &format_group_section(gname, svcs, hostname));
+                }
+            }
+            _ => {
+                custom_sections.push(format_group_section(gname, svcs, hostname));
+            }
         }
+    }
+
+    // Insert custom sections before footer if any exist
+    if !custom_sections.is_empty() {
+        let combined: String = custom_sections.join("");
+        let footer_placeholder = format!("\n{}</div>\n<!-- FOOTER -->", combined);
+        html = html.replace("<!-- FOOTER -->", &footer_placeholder);
     }
 
     // Step 3: Fill title and IP from splash-meta.json
@@ -234,8 +218,6 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(t) = meta.get("title").and_then(|v| v.as_str()) {
                 html = html.replace("<span id=\"page-title\"></span>", t);
-
-                // Fill IP display if available
                 if let Some(ip) = meta.get("ip_display").and_then(|v| v.as_str()) {
                     let ip_span = format!("<span class='subtitle-ip'>[{ip}]</span>");
                     html = html.replace(
@@ -247,17 +229,48 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         }
     }
 
-    // Step 4: Footer with hostname and IP
-    let ip_display = if !meta_path.exists() || meta_path.is_file() {
-        fs::read_to_string(&meta_path).ok()
-            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
-            .and_then(|m| m.get("ip_display").and_then(|x| x.as_str().map(String::from)))
-    } else {
-        None
-    }.unwrap_or_else(|| "*".to_string());
+    // Step 4: Footer
+    let ip_display = fs::read_to_string(&meta_path).ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|m| m.get("ip_display").and_then(|x| x.as_str().map(String::from)))
+        .unwrap_or_else(|| "*".to_string());
 
     let footer = format!("{} {} {} | powered by server-splash", output.hostname, "\u{2014}", ip_display);
     html = html.replace("<!-- FOOTER -->", &esc(&footer).into_owned());
 
-    Ok(html)
+    // Step 5: Write to disk
+    let out_dir = output.output_dir.clone();
+    fs::create_dir_all(&out_dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
+    let out_path = out_dir.join("splash-server.html");
+    fs::write(&out_path, &html).map_err(|e| format!("Failed to write file: {e}"))?;
+
+    Ok(out_path.to_string_lossy().to_string())
+}
+
+pub(crate) fn generate_ollama_ui(
+    output_dir: &std::path::Path,
+    hostname: &str,
+    port: u16,
+    _glances_port: Option<u16>,
+) -> Result<String, String> {
+    use std::path::PathBuf;
+
+    let mut html = include_str!("ollama-ui/template.html").to_string();
+
+    // Replace placeholders — try hostname_override first, fall back to hostname
+    let hn_esc = esc(hostname).into_owned();
+    for _ in 0..3 {
+        html = html.replace("<!-- HOSTNAME -->", &hn_esc);
+    }
+    html = html.replace("<!-- PORT -->", &port.to_string());
+    html = html.replace(
+        "<!-- GLANCES_PORT -->",
+        &_glances_port.unwrap_or(61208).to_string(),
+    );
+
+    fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
+    let out_path = PathBuf::from(output_dir).join("ollama-dashboard.html");
+    fs::write(&out_path, &html).map_err(|e| format!("Failed to write file: {e}"))?;
+
+    Ok(out_path.to_string_lossy().to_string())
 }

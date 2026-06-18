@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ollama Dashboard — <!-- HOSTNAME --></title>
+<style>
+  :root { --bg: #1a1b26; --card: #1e2030; --border: #292e42; --hover: #7aa2f7; --text: #a9b1d6; --bright: #c0caf5; --dim: #565f89; --green: #9ece6a; --red: #ff6e6a; --yellow: #e5f07a; --blue: #7aa2f7; --input-bg: #16161e; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: var(--bg); color: var(--text); padding: 2rem; max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 2rem; color: var(--bright); margin-bottom: .3rem; }
+  .subtitle { color: var(--dim); margin-bottom: 2rem; font-size: .9rem; }
+  h2 { color: var(--blue); font-size: 1.05rem; text-transform: uppercase; letter-spacing: .08em; margin: 2rem 0 .75rem; border-bottom: 1px solid var(--border); padding-bottom: .4rem; }
+
+  /* Status bar */
+  #status-bar { display: flex; align-items: center; justify-content: space-between; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: .75rem 1.25rem; }
+  #status-text { font-size: .9rem; color: var(--dim); }
+  #status-text span.running { color: var(--green); }
+  #status-text span.idle { color: var(--yellow); }
+  #status-text span.error { color: var(--red); }
+  #refresh-btn { background: var(--border); color: var(--text); border: none; padding: .4rem .9rem; border-radius: 4px; cursor: pointer; font-size: .85rem; margin-left: 1rem; }
+  #refresh-btn:hover { background: var(--hover); color: var(--bg); }
+
+  /* GPU / VRAM metrics */
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: .65rem; margin-top: 1rem; }
+  .metric-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: .75rem 1rem; text-align: center; }
+  .metric-label { font-size: .72rem; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .3rem; }
+  .metric-value { font-size: 1.4rem; font-weight: 600; color: var(--bright); }
+  .metric-sub { font-size: .72rem; color: var(--dim); }
+
+  /* Running model details panel */
+  .running-panel { background: var(--card); border: 1px solid var(--green); border-radius: 6px; padding: 1.25rem; margin-top: .5rem; }
+  .running-header { display: flex; align-items: center; gap: .75rem; margin-bottom: 1rem; }
+  .running-name { font-size: 1.3rem; color: var(--green); font-weight: 600; }
+  .running-badge { font-size: .72rem; padding: 2px 10px; border-radius: 4px; background: rgba(158,206,106,.15); color: var(--green); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .running-details { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: .65rem; }
+  .detail-item { background: var(--input-bg); border-radius: 4px; padding: .6rem .75rem; }
+  .detail-label { font-size: .7rem; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .2rem; }
+  .detail-value { font-size: .95rem; color: var(--bright); word-break: break-word; }
+  .capability-tags { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .25rem; }
+  .cap-tag { font-size: .68rem; padding: 2px 9px; border-radius: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .cap-true { background: rgba(158,206,106,.15); color: var(--green); }
+  .cap-false { background: rgba(86,95,137,.1); color: var(--dim); }
+  .cap-info { background: rgba(122,162,247,.1); color: var(--blue); }
+
+  /* No-running state */
+  #no-running { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--yellow); border-radius: 6px; padding: 1.25rem; margin-top: .5rem; color: var(--dim); }
+
+  /* Model cards */
+  .model-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: .75rem; margin-top: .5rem; }
+  .model-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1.1rem 1.25rem; position: relative; transition: border-color .15s, transform .1s; }
+  .model-card:hover { border-color: var(--hover); transform: translateY(-2px); cursor: pointer; }
+  .model-card.active { border-color: var(--green); box-shadow: 0 0 12px rgba(158,206,106,.12); }
+  .model-name { font-size: 1.05rem; color: var(--bright); font-weight: 600; margin-bottom: .3rem; }
+  .model-detail { display: flex; gap: .25rem; color: var(--dim); font-size: .78rem; align-items: center; flex-wrap: wrap; }
+  .model-detail-item { background: var(--input-bg); padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
+  .tag-list { display: flex; gap: .35rem; margin-top: .6rem; flex-wrap: wrap; }
+  .capability-tag { font-size: .68rem; padding: 2px 7px; border-radius: 4px; background: rgba(122,162,247,.1); color: var(--blue); border: 1px solid rgba(122,162,247,.15); text-transform: uppercase; letter-spacing: .04em; }
+  .model-size { font-size: .88rem; color: var(--text); margin-top: .6rem; }
+  .status-badge { position: absolute; top: .85rem; right: .9rem; font-size: .72rem; padding: 2px 10px; border-radius: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .status-badge.running { background: rgba(158,206,106,.15); color: var(--green); }
+  .status-badge.idle { background: rgba(229,240,122,.1); color: var(--yellow); }
+
+  /* Chat */
+  .chat-panel { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1.25rem; margin-top: .5rem; }
+  #model-select { width: 100%; max-width: 400px; padding: .6rem .75rem; background: var(--input-bg); color: var(--bright); border: 1px solid var(--border); border-radius: 4px; font-size: .9rem; margin-bottom: .6rem; }
+  #model-select:focus { outline: none; border-color: var(--blue); }
+  .chat-container { display: flex; gap: .5rem; margin-top: .75rem; }
+  #prompt-input { flex: 1; padding: .65rem .75rem; background: var(--input-bg); color: var(--bright); border: 1px solid var(--border); border-radius: 4px; font-family: monospace; font-size: .88rem; resize: vertical; min-height: 44px; }
+  #prompt-input:focus { outline: none; border-color: var(--blue); }
+  #send-btn, #stop-btn { padding: .65rem 1.2rem; background: var(--blue); color: var(--bg); border: none; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: .88rem; white-space: nowrap; align-self: flex-end; margin-top: auto; }
+  #send-btn:hover { opacity: .85; }
+  #stop-btn { background: var(--red); display: none; align-self: flex-end; padding: .65rem 1.2rem; border: none; border-radius: 4px; font-weight: 600; cursor: pointer; font-size: .88rem; margin-top: auto; }
+  #chat-output { background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; max-height: 520px; overflow-y: auto; padding: 1rem; margin-top: .75rem; font-family: monospace; font-size: .84rem; line-height: 1.65; white-space: pre-wrap; }
+  #chat-output::-webkit-scrollbar { width: 6px; }
+  #chat-output::-webkit-scrollbar-track { background: transparent; }
+  #chat-output::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .chat-msg-user { color: var(--green); margin-bottom: .5rem; }
+  .chat-msg-ai { color: var(--text); margin-bottom: 1rem; padding-left: .5rem; border-left: 2px solid var(--border); }
+  .chat-msg-err { color: var(--red); font-style: italic; }
+
+  footer { margin-top: 2.5rem; color: #292e42; font-size: .72rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Ollama Dashboard</h1>
+<p class="subtitle"><!-- HOSTNAME --> &mdash; local LLM inference &mdash; <strong id="port-label">:<!-- PORT --></strong></p>
+
+<div id="status-bar">
+  <span id="status-text">Connecting to Ollama...</span>
+  <button id="refresh-btn" onclick="init()">Refresh</button>
+</div>
+
+<h2>GPU / VRAM Metrics</h2>
+<div class="metrics-grid" id="metrics-grid"></div>
+
+<!-- Running Model Details Panel -->
+<h2>Currently Loaded Model</h2>
+<div id="running-panel"></div>
+
+<h2>Available Models</h2>
+<div class="model-grid" id="models-grid">Loading models...</div>
+
+<h2>Chat with Ollama</h2>
+<div class="chat-panel">
+  <select id="model-select"></select>
+  <div class="chat-container">
+    <textarea id="prompt-input" placeholder="Type your message... (Enter to send)" rows="2"></textarea>
+    <button id="send-btn" onclick="handleSend()">Send</button>
+    <button id="stop-btn" onclick="doStop()">Stop</button>
+  </div>
+  <div id="chat-output">
+    <span class="placeholder-msg">Conversation history will appear here...</span>
+  </div>
+</div>
+
+<footer><!-- HOSTNAME --> &mdash; Ollama Dashboard</footer>
+
+<script>
+const API = 'http://<!-- HOSTNAME -->:<!-- PORT -->/api';
+let conversationHistory = [];
+let currentModel = null;
+let chatAbortController = null;
+let modelShowCache = {};
+
+// --- Formatting helpers ---
+function humanBytes(b) {
+  if (b == null || b === 0) return '—';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+function humanGB(b) {
+  if (b == null || b === 0) return '—';
+  return ((b / 1e9)).toFixed(2);
+}
+
+// --- Init ---
+async function init() {
+  await refreshStatus();
+  await fetchModels();
+}
+
+async function refreshStatus() {
+  const el = document.getElementById('status-text');
+  try {
+    const resp = await fetch(API + '/ps');
+    const data = await resp.json();
+    if (data && data.models && data.models.length > 0) {
+      currentModel = data.models[0];
+      el.innerHTML = '<span class="running">●</span> Loaded: <strong>' + data.models[0].model + '</strong>';
+      renderMetrics(data.models);
+      renderRunningPanel();
+    } else {
+      currentModel = null;
+      el.innerHTML = '<span class="idle">○</span> Ollama reachable — no models loaded';
+      document.getElementById('metrics-grid').innerHTML = '';
+      document.getElementById('running-panel').innerHTML = '<div id="no-running"><strong>No model currently loaded.</strong><br>Pick a model from below and send a chat message to load it into VRAM.</div>';
+    }
+  } catch(e) {
+    el.innerHTML = '<span class="error">✕</span> Cannot reach ' + API + ': is Ollama running on :<!-- PORT -->?';
+  }
+}
+
+// --- Metrics panel (GPU stats) ---
+function renderMetrics(models) {
+  const container = document.getElementById('metrics-grid');
+  let totalVRAM = 0, totalLoaded = 0;
+  models.forEach(m => {
+    totalVRAM += m.size_vram || 0;
+    totalLoaded += m.size || 0;
+  });
+
+  // GPU data from glances (same host)
+  let gpuExtra = '';
+  fetch('http://<!-- HOSTNAME -->:<!-- GLANCES_PORT -->/api/4/gpu').then(r => r.json()).then(gpuData => {
+    if (Array.isArray(gpuData)) {
+      gpuData.forEach(gpu => {
+        if (gpu && gpu.key === 'gpu_id') {
+          const temp = gpu.temperature != null ? gpu.temperature + '\u00b0C' : '\u2014';
+          const fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '\u2014';
+          gpuExtra += '<div class="metric-card"><div class="metric-label">GPU ' + (gpu.gpu_id || 0) + ' Temp</div><div class="metric-value">' + temp + '</div></div><div class="metric-card"><div class="metric-label">GPU ' + (gpu.gpu_id || 0) + ' Fan</div><div class="metric-value">' + fan + '</div></div>';
+        }
+      });
+    }
+  }).catch(() => {});
+
+  container.innerHTML =
+    '<div class="metric-card"><div class="metric-label">GPU VRAM Used</div><div class="metric-value">' + humanGB(totalLoaded) + ' GB</div><div class="metric-sub">from ' + (totalVRAM === totalLoaded ? 'all layers on GPU' : humanBytes(totalVRAM)) + '</div></div>' +
+    '<div class="metric-card"><div class="metric-label">Host RAM Usage</div><div class="metric-value">' + humanBytes(totalLoaded) + '</div><div class="metric-sub">memory in use (bytes)</div></div>' +
+    (models.length > 0 && models[0].context_length ? '<div class="metric-card"><div class="metric-label">Context Window</div><div class="metric-value">' + (models[0].context_length / 1024).toFixed(0) + 'K</div><div class="metric-sub">tokens</div></div>' : '') +
+    gpuExtra;
+}
+
+// --- Running model details panel ---
+async function renderRunningPanel() {
+  const el = document.getElementById('running-panel');
+  if (!currentModel) { return; }
+  let showData = modelShowCache[currentModel.model];
+  if (!showData) {
+    try {
+      const resp = await fetch(API + '/show', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name: currentModel.model}) });
+      showData = await resp.json();
+      modelShowCache[currentModel.model] = showData;
+    } catch(e) {
+      el.innerHTML = '<div style="color:var(--red)">Failed to load details for ' + currentModel.model + '</div>';
+      return;
+    }
+  }
+
+  const d = showData.details || {};
+  const info = showData.model_info || {};
+  const archPrefix = info['general.architecture'] || '';
+  const archProp = (k) => info[archPrefix + '.' + k];
+
+  // Gather capabilities from model_info
+  const hasThinking = currentModel && currentModel.model.includes('thinking');
+  const capTags = [];
+  if (showData.capabilities) {
+    showData.capabilities.forEach(c => {
+      capTags.push({ label: c, cls: 'cap-info' });
+    });
+  }
+
+  let html = '<div class="running-header"><span class="running-name">' + (d.model || currentModel.model) + '</span><span class="running-badge">● LOADED</span></div>';
+  html += '<div class="running-details">';
+
+  const detailsList = [
+    ['Architecture', archProp('architecture') || d.formats || '\u2014'],
+    ['Parameter Size', d.parameter_size || '\u2014'],
+    ['Quantization', d.quantization_level || d.format || '\u2014'],
+    ['Context Length', (d.context_length ? formatNum(d.context_length) + ' tokens' : '\u2014')],
+    ['Embedding Length', archProp('embedding_length') ? formatNum(parseInt(archProp('embedding_length'))) : '-'],
+    ['File Type', info['general.file_type'] ? 'type ' + info['general.file_type'] : (d.format || '-')],
+    ['Family', (d.families || []).join(', ') || '\u2014'],
+  ];
+
+  // Extra architecture-specific details
+  if (archProp('head_count')) {
+    detailsList.push(['Attention Heads', archProp('head_count')] + [archProp('head_count_kv') ? ' / KV: ' + archProp('head_count_kv') : '']);
+  }
+  info['qwen35moe.expert_used_count'] !== undefined && detailsList.push(['Active Experts', info['qwen35moe.expert_used_count'] + ' of ' + (info['qwen35moe.expert_count'] || '?')]);
+  info['block_count'] !== undefined && archPrefix && detailsList.push(['Layers', info['block_count']]);
+
+  detailsList.forEach(function(row, i) {
+    const label = row[0];
+    const val = row.slice(1).join(' ');
+    html += '<div class="detail-item"><div class="detail-label">' + label + '</div><div class="detail-value">' + (val || '\u2014') + '</div></div>';
+  });
+
+  html += '</div>'; // details
+
+  // Capabilities section
+  if (showData.capabilities && showData.capabilities.length > 0) {
+    html += '<div style="margin-top:1rem;"><div class="detail-label" style="margin-bottom:.4rem;">Capabilities</div><div class="capability-tags">';
+    showData.capabilities.forEach(c => {
+      html += '<span class="cap-tag cap-info">' + c + '</span>';
+    });
+    // Check if it supports embedding
+    if (showData.requires && typeof showData.requires === 'string') {
+      const reqs = showData.requires.toLowerCase();
+      ['vision', 'embedding', 'tool'].forEach(function(cap) {
+        if (reqs.indexOf(cap) !== -1) html += '<span class="cap-tag cap-true">' + cap + '</span>';
+      });
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+function formatNum(n) {
+  return Number(n).toLocaleString();
+}
+
+// --- Models list ---
+async function fetchModels() {
+  const grid = document.getElementById('models-grid');
+  try {
+    const resp = await fetch(API + '/tags');
+    const data = await resp.json();
+    if (!data.models || data.models.length === 0) {
+      grid.innerHTML = 'No models found \u2014 pull one via <code>ollama pull &lt;name&gt;</code>';
+      return;
+    }
+
+    let html = '';
+    let selectHTML = '';
+
+    for (const m of data.models) {
+      const isActive = currentModel && currentModel.model === m.name;
+      const parts = m.name.split(':');
+      const modelName = parts[0];
+      const tag = parts.length > 1 ? ':' + parts.slice(1).join(':') : '(default)';
+
+      html += '<div class="model-card' + (isActive ? ' active' : '') + '" onclick="selectByCard(this,\'' + m.name + '\')">\n';
+      html += '<span class="status-badge ' + (isActive ? 'running' : 'idle') + '">' + (isActive ? '\u25cf LOADED' : '\u25cb IDLE') + '</span>\n';
+      html += '<div class="model-name">' + modelName + '</div>';
+      html += '<div class="model-detail"><span class="model-detail-item">tag: ' + tag + '</span><span class="model-detail-item">' + humanBytes(m.size) + '</span></div>\n';
+      // Show VRAM estimate for loading
+      const vram = isActive && currentModel ? humanGB(currentModel.size_vram) : '\u2014';
+      html += '<div class="model-size">Params: ' + (m.details.parameter_size || '?') + ' &bull; Size: ' + humanGB(m.size) + ' GB &bull; VRAM if loaded: ' + vram + ' GB</div>\n';
+      // Families / capabilities as tags
+      const families = m.details.families || [];
+      html += '<div class="tag-list">' + families.map(function(f) { return '<span class="capability-tag">' + f.replace(/_/g,'.') + '</span>'; }).join('');
+      if (m.details.format) html += '<span class="capability-tag">' + m.details.format.toUpperCase() + '</span>';
+      html += '</div></div>';
+
+      // Dropdown option with full name and size in GB
+      const selected = (currentModel && currentModel.model === m.name) ? 'selected' : '';
+      selectHTML += '<option value="' + m.name + '" ' + selected + '>' + m.name + ' (' + humanGB(m.size) + 'g)\n</option>';
+    }
+
+    grid.innerHTML = html;
+
+    // Apply to dropdown
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = selectHTML;
+  } catch(e) {
+    grid.innerHTML = '<span style="color:var(--red)">Failed to load models: ' + e.message + '</span>';
+  }
+}
+
+function selectByCard(el, name) {
+  // Highlight the card and set dropdown
+  document.querySelectorAll('.model-card').forEach(function(c) { c.style.outline = ''; });
+  el.style.outline = '2px solid var(--blue)';
+  setTimeout(function(){ el.style.outline = ''; }, 600);
+  const sel = document.getElementById('model-select');
+  for (let i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === name) { sel.selectedIndex = i; break; }
+  }
+}
+
+// --- Chat helpers ---
+// NEVER use escapeHTML on content that should render newlines.
+// Use textContent + CSS white-space: pre-wrap instead.
+let accumulatedText = '';
+let streamEl = null;  // reference to the streaming message div
+
+function finalizeChat() {
+  if (!streamEl) return;
+  const text = accumulatedText.trim();
+  if (text) {
+    streamEl.className = 'chat-msg-ai';
+    streamEl.removeAttribute('data-streaming');
+    streamEl.textContent = text;
+  } else {
+    // No actual content produced — remove the empty shell
+    if (streamEl.parentNode === document.getElementById('chat-output')) {
+      streamEl.remove();
+    }
+    streamEl = null;
+  }
+}
+
+// --- Chat ---
+async function handleChat(model, messages) {
+  const output = document.getElementById('chat-output');
+  const ph = output.querySelector('.placeholder-msg');
+  if (ph) output.innerHTML = '';
+
+  // Reset streaming state
+  accumulatedText = '';
+  streamEl = null;
+  let finishedChatting = false;
+
+  try {
+    chatAbortController = new AbortController();
+    const res = await fetch(API + '/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ model: model, messages: messages }),
+      signal: chatAbortController.signal
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    // User message line (append-only, never cleared)
+    const userDiv = document.createElement('div');
+    userDiv.className = 'chat-msg-user';
+    const userText = document.createTextNode('You: ');
+    const userSpan = document.createElement('span');
+    userSpan.textContent = messages[messages.length - 1].content;
+    userSpan.style.color = 'var(--text)';
+    userDiv.appendChild(userText);
+    userDiv.appendChild(userSpan);
+    output.appendChild(userDiv);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let lineEnd;
+      while ((lineEnd = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, lineEnd).trim();
+        buffer = buffer.slice(lineEnd + 1);
+        if (!line) continue;
+        try {
+          const chunk = JSON.parse(line);
+          const content = (chunk.message && chunk.message.content) || '';
+          if (content) {
+            accumulatedText += content;
+            // Create streaming div on first real content
+            if (!streamEl) {
+              streamEl = document.createElement('div');
+              streamEl.className = 'chat-msg-ai streaming-msg';
+              streamEl.setAttribute('data-streaming', 'true');
+              streamEl.style.whiteSpace = 'pre-wrap';
+              output.appendChild(streamEl);
+            }
+            // Use textContent (auto-escapes). CSS white-space: pre-wrap handles newlines.
+            streamEl.textContent = accumulatedText + '\u2551';
+            autoScroll(output);
+          }
+        } catch(_) {}
+      }
+    }
+
+    // Finalize: remove cursor, keep text in stable div
+    if (streamEl) {
+      const text = accumulatedText.trim();
+      if (text) {
+        streamEl.className = 'chat-msg-ai';
+        streamEl.removeAttribute('data-streaming');
+        streamEl.style.whiteSpace = 'pre-wrap';
+        streamEl.textContent = text;
+        conversationHistory.push(messages[messages.length - 1]);
+      } else {
+        // No content — remove empty streaming div
+        streamEl.remove();
+        streamEl = null;
+      }
+    }
+
+    finishedChatting = true;
+
+  } catch(e) {
+    const streamingEl = output.querySelector('.streaming-msg');
+    if (e.name === 'AbortError') {
+      updateChatStream(' [stopped]');
+    } else {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'chat-msg-err';
+      errDiv.textContent = 'Error: ' + e.message;
+      output.appendChild(errDiv);
+    }
+  } finally {
+    finishedChatting = true;
+    document.getElementById('send-btn').style.display = '';
+    document.getElementById('stop-btn').style.display = 'none';
+    chatAbortController = null;
+  }
+}
+
+function doStop() {
+  if (chatAbortController) chatAbortController.abort();
+}
+
+function updateChatStream(text) {
+  const output = document.getElementById('chat-output');
+  let el = output.querySelector('.streaming-msg');
+  if (!el) { el = document.createElement('div'); el.className = 'chat-msg-ai streaming-msg'; output.appendChild(el); }
+  el.style.whiteSpace = 'pre-wrap';
+  el.textContent = text + '\u2551';
+  autoScroll(output);
+}
+
+function autoScroll(el) { el.scrollTop = el.scrollHeight; }
+function escapeHTML(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
+
+async function handleSend() {
+  const select = document.getElementById('model-select');
+  const input = document.getElementById('prompt-input');
+  if (!input.value.trim()) return;
+  if (select.options.length === 0) { alert('No models available. Pull one first.'); return; }
+  const model = select.options[select.selectedIndex].value;
+  const message = input.value.trim();
+
+  conversationHistory.push({ role: 'user', content: message });
+  document.getElementById('send-btn').style.display = 'none';
+  document.getElementById('stop-btn').style.display = '';
+  await handleChat(model, [...conversationHistory]);
+  input.value = '';
+  document.getElementById('send-btn').style.display = '';
+}
+
+// Enter to send
+document.addEventListener('DOMContentLoaded', () => {
+  const input = document.getElementById('prompt-input');
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+  });
+  init();
+});
+
+// Auto-refresh status every 15s
+setInterval(refreshStatus, 15000);
+</script>
+
+</body>
+</html>

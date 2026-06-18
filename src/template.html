@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title><!-- HOSTNAME --> — Server Splash</title>
+<title><!-- HOSTNAME --> Services</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #1a1b26; color: #a9b1d6; padding: 3rem 2rem; }
@@ -28,7 +29,7 @@
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: .75rem; }
   .card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: 1rem 1.25rem; display: flex; align-items: center; gap: .6rem; transition: border-color .15s, background-color .3s; position: relative; }
   .card:hover { border-color: #7aa2f7; cursor: pointer; }
-  .card.status-up   { border-color: #9ece6a; animation: none; }
+  .card.status-unknown { border-color: #3d425a; }
   .card.status-down { border-color: #ff6e6e; background: linear-gradient(135deg, #3b1515 0%, #1e2030 40%); cursor: default; }
 
   @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
@@ -42,7 +43,7 @@
   .name { color: #c0caf5; font-weight: 600; font-size: .95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .desc { color: #565f89; font-size: .78rem; margin-top: .15rem; }
 
-  /* links modal */
+  /* modal */
   .modal-overlay { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.4); backdrop-filter: blur(4px); align-items: center; justify-content: center; }
   .modal-overlay.open { display: flex !important; }
   .modal-box { width: min(780px, 92vw); max-height: 70vh; background: #1e2030; border: 1px solid #414868; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
@@ -67,9 +68,12 @@
 <body>
 
 <h1><!-- HOSTNAME --></h1>
-<p class="subtitle">// quick-launch dashboard — services directory</p>
+<p class="subtitle">Quick-launch dashboard — services directory</p>
 
-<!-- GPU_STATS_PLACEHOLDER -->
+<!-- GPU STATS -->
+<div class="gpu-section">
+  <div class="gpu-grid" id="gpu-list"></div>
+</div>
 
 <h2>&#x2699;&#xFE0F; Host Services</h2>
 <div class="grid" id="host-grid">
@@ -93,44 +97,45 @@
 </div>
 
 <script>
-// GPU Stats from Glances API
+// ── GPU Stats from Glances API ──
 function renderGPUs() {
-  var container = document.getElementById('gpu-list');
-  if (!container) return;
+  const container = document.getElementById('gpu-list');
+
   fetch('<!-- GLANCES_URL -->/api/4/gpu')
-    .then(function(r) { return r.json(); })
-    .then(function(gpuData) {
+    .then(r => r.json())
+    .then(gpuData => {
       if (!Array.isArray(gpuData) || gpuData.length === 0) {
         container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
         return;
       }
-      var html = '';
-      for (var i = 0; i < gpuData.length; i++) {
-        var gpu = gpuData[i];
+      let html = '';
+      for (const gpu of gpuData) {
         if (gpu && gpu.key == 'gpu_id') {
-          var name = gpu.name ? gpu.name.replace(/ /g, '&lt;wbr&gt;') : 'GPU';
-          var memPct = Math.round((gpu.mem || 0));
-          var proc = gpu.proc != null ? gpu.proc : '-';
-          var temp = gpu.temperature != null ? gpu.temperature + '\u00B0C' : '-';
-          var fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '\u2014';
+          const name = gpu.name ? gpu.name.replace(/ /g, '<wbr>') : 'GPU';
+          const memPct = Math.round((gpu.mem || 0));
+          const proc = gpu.proc ?? '-';
+          const temp = gpu.temperature != null ? gpu.temperature + '\u00B0C' : '-';
+          const fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '—';
 
-          var loadColor = '#9ece6a';
+          let loadColor = '#9ece6a';
           if (memPct > 80) loadColor = '#ff6e6a';
           else if (memPct > 40) loadColor = '#e5f07a';
 
-          html += '<div class="gpu-card">' +
-            '<div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> ' + name + '</div>' +
-            '<strong style="color:' + loadColor + ';font-size:1.55rem;">' + memPct + '<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>' +
-            '<div class="gpu-metrics">' +
-              '<div class="gpu-metric"><span class="gpu-label">Compute:</span>' + proc + '%</div>' +
-              '<div class="gpu-metric"><span class="gpu-label">Temp:</span>' + temp + '</div>' +
-              '<div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>' + fan + '</div>' +
-            '</div></div>';
+          html += `
+            <div class="gpu-card">
+              <div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> ${name}</div>
+              <strong style="color:${loadColor};font-size:1.55rem;">${memPct}<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>
+              <div class="gpu-metrics">
+                <div class="gpu-metric"><span class="gpu-label">Compute:</span>${proc}%</div>
+                <div class="gpu-metric"><span class="gpu-label">Temp:</span>${temp}</div>
+                <div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>${fan}</div>
+              </div>
+            </div>`;
         }
       }
       container.innerHTML = html;
     })
-    .catch(function() {
+    .catch(() => {
       if (!container.querySelector('h3')) {
         container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
       }
@@ -140,7 +145,7 @@ function renderGPUs() {
 renderGPUs();
 setInterval(renderGPUs, 3000);
 
-// OpenService: click any card → open that URL
+// ── OpenService: click any card with http probe → open that URL in new tab ──
 function openService(el) {
   var link = el.querySelector('.link');
   if (!link) return;
@@ -148,52 +153,36 @@ function openService(el) {
   window.location.href = url;
 }
 
-// Logs Modal
+// ── Logs Modal ──
 function fetchLogs(serviceName) {
-  var overlay = document.getElementById('logs-modal-overlay');
-  var titleEl = document.getElementById('modal-service');
-  var bodyEl = document.getElementById('modal-body');
+  const overlay = document.getElementById('logs-modal-overlay');
+  const titleEl = document.getElementById('modal-service');
+  const bodyEl = document.getElementById('modal-body');
 
   titleEl.textContent = serviceName + ' logs';
-  bodyEl.innerHTML = '<span style="color:#7aa2f7;">Fetching...</span>';
+  bodyEl.innerHTML = '<span style="color:#7aa2f7;">Fetching...<\/span>';
   overlay.classList.add('open');
+
+  fetch('/api/logs?service=' + encodeURIComponent(serviceName))
+    .then(r => r.json())
+    .then(data => {
+      if (data.error || !data.logs) {
+        bodyEl.innerHTML = '<span style="color:#ff6e6a;">' + (data.error || 'No logs available') + '<\/span>';
+        return;
+      }
+      const lines = typeof data.logs === 'string' ? data.logs.split('\n') :
+        Array.isArray(data.logs) ? data.logs.toString().split('\n') : [String(data.logs)];
+      const shown = lines.slice(0, 150);
+      bodyEl.textContent = shown.join('\n') + (lines.length > 150 ? '\n\n... more' : '');
+    })
+    .catch(e => {
+      bodyEl.innerHTML = '<span style="color:#ff6e6a;">Failed to fetch: ' + e.message + '<\/span>';
+    });
 }
 
 function closeModal() {
   document.getElementById('logs-modal-overlay').classList.remove('open');
 }
-
-// Probe status updates
-(function() {
-  var cards = document.querySelectorAll('.card[data-probe]');
-  cards.forEach(function(card) {
-    var probeUrl = card.getAttribute('data-probe');
-    var icon = card.querySelector('.status-icon');
-
-    // Try with CORS proxy for cross-origin health checks
-    fetch(probeUrl, { mode: 'no-cors' })
-      .then(function() {
-        if (icon) icon.innerHTML = '&#x1F7E2;';
-        card.classList.remove('status-unknown', 'status-down');
-        card.classList.add('status-up');
-      })
-      .catch(function() {
-        if (icon) { /* keep default or set down */ }
-      });
-
-    // Click handler for cards with links
-    if (probeUrl && !card.hasAttribute('data-clicked')) {
-      card.setAttribute('data-clicked', '1');
-      card.addEventListener('click', function(e) {
-        var linkEl = card.querySelector('.link');
-        if (linkEl && linkEl.getAttribute('href')) {
-          e.preventDefault();
-          window.location.href = linkEl.getAttribute('href');
-        }
-      });
-    }
-  });
-})();
 </script>
 <footer><!-- FOOTER --></footer>
 </body>

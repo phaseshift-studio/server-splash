@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use dialoguer::{theme::ColorfulTheme, Input, MultiSelect};
+use dialoguer::Input;
 use atty::Stream;
+use unicode_width::UnicodeWidthChar;
 
 /// ANSI color helpers — produces colored output on TTYs, plain text otherwise.
 fn bold_yellow(s: &str) -> String { format!("\x1b[1;33m{}\x1b[0m", s) }
@@ -12,7 +12,6 @@ fn magenta(s: &str) -> String { format!("\x1b[35m{}\x1b[0m", s) }
 fn green(s: &str) -> String { format!("\x1b[32m{}\x1b[0m", s) }
 fn yellow(s: &str) -> String { format!("\x1b[33m{}\x1b[0m", s) }
 fn red(s: &str) -> String { format!("\x1b[31m{}\x1b[0m", s) }
-fn bold_magenta(s: &str) -> String { format!("\x1b[1;35m{}\x1b[0m", s) }
 
 /// A SplashService parsed from agent JSON analysis.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -37,13 +36,213 @@ pub(crate) struct GuiAddon {
     pub icon: String,
 }
 
+// ─── TUI drawing helpers ──────────────────────────────────────────────
+
+fn display_w(s: &str) -> usize {
+    s.chars().fold(0, |n, c| if c == '\x1b' { n } else { n + c.width().unwrap_or(0) })
+}
+
+fn strip_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut esc = false;
+    for c in s.chars() {
+        if c == '\x1b' { esc = true; }
+        else if esc { if c == 'm' { esc = false; } }
+        else { out.push(c); }
+    }
+    out
+}
+
+/// Draw a boxed menu with title and items. Items may contain ANSI colors.
+fn box_menu(title: &str, items: &[String]) -> String {
+    // Hostname
+    let config = crate::config::SplashConfig::load();
+    let hostname = config.hostname
+        .clone()
+        .or_else(get_hostname)
+        .unwrap_or_else(|| "localhost".to_string());
+    eprintln!("{}: {}", bold_cyan("Hostname"), cyan(&hostname));
+
+    if items.is_empty() { return String::new(); }
+
+    let mut max_w = display_w(title) as i32;
+    for it in items {
+        let w = display_w(it) as i32;
+        if w > max_w { max_w = w; }
+    }
+    max_w = (max_w + 6).min(78);
+    let w = max_w.max(24);
+
+    fn pad(n: usize) -> String { " ".repeat(n) }
+    let sep = "─".repeat(w as usize - 2);
+
+    let mut o = String::new();
+
+    // Top border (yellow)
+    o.push_str(&yellow(&format!("┌{}┐", sep)));
+    o.push('\n');
+
+    // Title centered
+    let lw = ((w - 4) as i32 - display_w(title).max(1) as i32).max(0) / 2;
+    o.push_str("│ ");
+    o.push_str(&pad(lw as usize));
+    o.push_str(&bold_title(title));
+    let rw = (w - 4 - lw as i32 - display_w(title).max(1) as i32).max(0);
+    o.push_str(&pad(rw as usize));
+    o.push_str(" │\n");
+
+    // Separator under title
+    o.push_str(&format!("├{}┤", "─".repeat(w as usize - 2)));
+    o.push('\n');
+
+    // Items with indentation
+    for it in items {
+        let bare = strip_esc(it);
+        let iw = display_w(&bare) as i32;
+        // Pad the line so that total visible width equals `w`. The item string already
+        // includes its own ANSI colour codes, which `display_w` ignores. We add a 3‑char
+        // left indent and a 2‑char right padding (space + vertical bar). Thus the
+        // remaining space is `w - iw - 6`.
+        o.push_str("│   ");                    // indent inside box
+        o.push_str(it);
+        let rem = (w - iw - 6).max(0);
+        o.push_str(&pad(rem as usize));
+        // Revert original spacing – one more space was added earlier. The
+        // correct string is three spaces followed by the vertical bar.
+        o.push_str(" │\n");
+    }
+
+    o.push_str(&yellow(&format!("└{}┘", sep)));
+    o
+}
+
+
+fn bold_title(s: &str) -> String { format!("\x1b[1m{}\x1b[0m", s) }
+
 /// Wizard state produced after user answers all prompts.
 pub(crate) struct WizardOutput {
     pub output_dir: PathBuf,
     pub hostname: String,
     pub selected_services: Vec<SplashService>,
-    pub gui_addons: Vec<GuiAddon>,
+    pub ollama_dashboard_selected: bool,
+    pub ollama_port: Option<u16>,
     pub glances_api_base: Option<String>,
+}
+
+/// Wrap text into lines of given width. Returns wrapped lines.
+fn wrap_lines(text: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
+        if len <= cols {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut start = 0;
+        while start < len {
+            // `end` is the half-open upper bound: chars[start..end) gets consumed
+            let end = std::cmp::min(start + cols, len);
+
+            // Scan for last whitespace in [start..end), convert to absolute index.
+            let break_pos_opt: Option<usize> = chars[start..end]
+                .iter()
+                .rposition(|c| c.is_whitespace())
+                .map(|i| start + i);
+
+            let break_idx = match break_pos_opt {
+                Some(p) if p > start => p - 1,  // break before the whitespace
+                _ => end.checked_sub(1).unwrap_or(start), // force word-break at boundary
+            };
+
+            let break_at = std::cmp::max(break_idx, start).min(len.saturating_sub(1));
+            out.push(chars[start..=break_at].iter().collect());
+            start = break_at + 1;
+        }
+    }
+    out
+}
+
+/// Draw a grid box around given lines with a title row.
+fn draw_grid(title: &str, lines: &[&str], max_lines: usize) -> String {
+    // Strip ANSI codes first — wrap plain text only (escape sequences inflate width calc and cause mid-line wraps)
+    let plain = lines.iter().map(|l| strip_esc(l)).collect::<Vec<_>>();
+    let display_lines = wrap_lines(&plain.join("\n"), 52);
+
+    let count = (max_lines * 4).min(display_lines.len());
+    let clipped = &display_lines[..count];
+
+    if clipped.is_empty() {
+        return format!("[ {} ] — no data", title);
+    }
+
+    let more_count = display_lines.len().saturating_sub(count);
+    let has_more = more_count > 0;
+    let show_lines: Vec<String> = if has_more {
+        clipped[..count - 1].to_vec()
+    } else {
+        clipped.to_vec()
+    };
+
+    // Determine column width from plain text content, cap at max terminal width
+    let mut w = title.len() as i32 + 4;
+    for l in &show_lines { w = std::cmp::max(w, (l.len() + 4) as i32); }
+    if has_more { w = std::cmp::max(w, ("{} more lines".len() + 5) as i32); }
+    w = w.clamp(10, 80);
+
+    fn cell(pad: usize) -> String { " ".repeat(pad) }
+
+    let mut out = String::new();
+
+    // Title line (centered with emoji)
+    out.push_str(&bold_yellow(&format!("📌 [ {} ]", title)));
+    out.push('\n');
+
+    // Content lines (plain text — ANSI codes caused width inflation)
+    for line in &show_lines {
+        let iw = w as usize;
+        if line.len() >= iw - 4 {
+            out.push_str("│ ");
+            out.push_str(&line[..(iw - 4)]);
+            out.push_str(" │");
+        } else {
+            out.push_str("│ ");
+            out.push_str(line);
+            let pad_w = (iw as i32 - 4 - line.len() as i32).max(0) as usize;
+            out.push_str(&cell(pad_w));
+            out.push_str("│");
+        }
+        out.push('\n');
+    }
+
+    // More lines indicator
+    if has_more {
+        let msg = format!("{} more lines", bold_yellow(&more_count.to_string()));
+        if display_w(&msg) as i32 >= w - 4 {
+            out.push_str("│ ");
+            let bare = strip_esc(&msg);
+            out.push_str(&bare.chars().take((w as usize) - 4).collect::<String>());
+            out.push_str("\n");
+        } else {
+            let pad_w = (w - 4 - display_w(&msg) as i32).max(0) as usize;
+            out.push_str("│ ");
+            out.push_str(&msg);
+            if pad_w > 0 {
+                out.push_str(&cell(pad_w));
+            }
+            out.push_str("│\n");
+        }
+        out.push('\n');
+    }
+
+    // Bottom border (plain ASCII, no ANSI)
+    out.push_str(&format!("└{}┘", "─".repeat((w - 2) as usize)));
+
+    out
 }
 
 /// Run the interactive wizard sequence.
@@ -58,23 +257,43 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
 
     // 2. Choose agent endpoint and model
     let base_url = ask_agent_endpoint(&config.agent_url)?;
-    let models = crate::agent::get_models(&base_url).ok().unwrap_or_default();
 
-    // Let user pick a model from the list (default to first if only one)
+    // Verify the endpoint is reachable before proceeding
+    if !crate::agent::is_openai_compatible(&base_url) {
+        anyhow::bail!(format!("{}: Agent endpoint {} is unreachable or not responding. Check the URL and try again.",
+            bold_red("Error"), base_url));
+    }
+
+    // Verify it actually returns models
+    let models = match crate::agent::get_models(&base_url) {
+        Ok(m) if !m.is_empty() => m,
+        _ => anyhow::bail!(format!("{}: Agent endpoint {} returned no available models. Select a different endpoint or check Ollama.",
+            bold_red("Error"), base_url)),
+    };
+
+    // Try to find the currently loaded model and use it as default
+    let current_model = crate::agent::get_default_model(&base_url);
+    let default_idx = current_model
+        .as_ref()
+        .and_then(|cm| models.iter().position(|m| m == cm))
+        .unwrap_or(0);
+
+    // Let user pick a model from the list (default to currently loaded, or first)
     let selected_model_name: String = match models.len() {
         0 => "default".into(),
         1 => models[0].clone(),
         _ => {
-            eprintln!("\n{}\n{}", bold_yellow("Available models"), green("---"));
+            // Model picker — boxed menu
+            let mut model_lines = Vec::with_capacity(models.len());
             for (i, m) in models.iter().enumerate() {
-                let tag = if i == 0 { " *(default)" } else { "" };
-                eprintln!("  [{}]{} {}", cyan(&format!("{}", i)), magenta(m), yellow(tag));
+                let tag = if i == default_idx { " *(default)" } else { "" };
+                model_lines.push(format!("{} {}{}{}", cyan(&format!("[{i}]")), magenta(m), yellow(tag), format!("\x1b[K")));
             }
-            eprintln!("{}", green("---"));
+            eprintln!("{}", box_menu("Select Model", &model_lines));
 
             let pick: String = Input::new()
-                .with_prompt("Select model number (press Enter for first)")
-                .default(("0").to_string())
+                .with_prompt("Select model number (press Enter for default)")
+                .default(default_idx.to_string())
                 .interact_text()
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
@@ -104,30 +323,11 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
         eprintln!(" {}", green("ok"));
     }
 
-    let mut full_input = hostname.to_string();
-    for out in &all_output {
-        full_input.push('\n');
-        full_input.push_str(out);
-    }
+    // Build the prompt content (hostname + system_prompt + raw output) that will be sent to agent.
+    // Only construct this once just before use so we don't hold a giant string in memory needlessly.
 
-    // 4. Send to agent for analysis
+    // 4. Send to agent for analysis and show structured summary of probes used as prompt.
     eprintln!("\n{}", bold_cyan("Sending to agent for analysis..."));
-
-    // Spawn a background thread to animate a spinner while blocked on HTTP
-    let stop_spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let stop = std::sync::Arc::clone(&stop_spin);
-        std::thread::spawn(move || {
-            let frames = ['-', '/', '|', '\\'];
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for &frame in &frames {
-                    print!("\r{:<60}{}", " ", frame);
-                    std::io::stdout().flush().ok();
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                }
-            }
-        });
-    }
 
     let system_prompt = r#"You are a Linux system analyst. I will give you raw output from system commands (systemctl list-units, docker ps, free, nvidia-smi, etc.).
 
@@ -152,15 +352,40 @@ Rules:
 5. Be concise — 8-16 services max unless genuinely more interesting ones exist
 
 Return ONLY valid JSON. No markdown fences, no explanation."#;
+eprintln!();
+eprintln!("{:<20} {}", bold_yellow("Sending prompt to agent:"), cyan(&system_prompt[..system_prompt.len().min(200)]));
+
+
+    // Spawn a background thread to animate a spinner while blocked on HTTP
+    let stop_spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = std::sync::Arc::clone(&stop_spin);
+        std::thread::spawn(move || {
+            let frames = ['-', '/', '|', '\\'];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for &frame in &frames {
+                    print!("\r{:<60}{}", " ", frame);
+                    std::io::stdout().flush().ok();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        });
+    }
+
+    let prompt_content = format!("{}\n\n{}", hostname, all_output.join("\n"));
 
     // Increase max_tokens so large probe outputs don't overflow context window
     const MAX_TOKENS: i32 = 8192;
 
-    let prompt_input = format!("{}\n\n{}", hostname, all_output.join("\n"));
-
     let analysis_text = {
+        // Re-verify endpoint is still alive — probes took time, Ollama may have unloaded the model
+        if !crate::agent::is_openai_compatible(&base_url) {
+            anyhow::bail!(format!("{}: Agent endpoint {} is no longer reachable after probe collection.",
+                bold_red("Error"), base_url));
+        }
+
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(300))
             .build()?;
 
         let resp = client
@@ -169,7 +394,7 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
                 "model": selected_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt_input}
+                    {"role": "user", "content": prompt_content}
                 ],
                 "temperature": 0.2,
                 "max_tokens": MAX_TOKENS,
@@ -209,7 +434,22 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
     // Stop spinner before parsing (blocking parse)
     stop_spin.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    let all_services = parse_agent_json(&analysis_text)?;
+    eprintln!("\n{} {}", bold_yellow("agent analysis"), cyan("(ctrl-o to expand)"));
+
+    // Show the agent's raw response as a compact summary grid.
+    let total_chars = analysis_text.len();
+    let lines: Vec<&str> = analysis_text.lines().collect();
+    eprintln!("\n{}", yellow(&draw_grid("Agent Response", &lines, 8)));
+    eprintln!("  Total: {} chars", cyan(&format!("{}", total_chars)));
+
+    let mut all_services = parse_agent_json(&analysis_text)?;
+
+    // Deduplicate by normalized name (case-insensitive) to remove agent duplicates
+    let mut seen_names = std::collections::HashSet::new();
+    all_services.retain(|svc| {
+        let key = svc.name.to_lowercase();
+        seen_names.insert(key) // keep = true (first), remove = false (duplicate)
+    });
 
     if all_services.is_empty() {
         anyhow::bail!(bold_red("Agent returned no services to display."));
@@ -217,81 +457,55 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
 
     eprintln!("\n{}: {}", bold_yellow("Found"), green(&format!("{} potential service(s)", all_services.len())));
 
-    // Group and display for selection
-    let mut grouped: HashMap<String, Vec<&SplashService>> = HashMap::new();
-    for svc in &all_services {
-        grouped.entry(svc.group.clone()).or_default().push(svc);
-    }
-
-    let mut selection_flat: Vec<SplashService> = Vec::with_capacity(all_services.len());
-    for svc in &all_services {
-        selection_flat.push(svc.clone());
-    }
-
-    // Group headers for display context
-    let mut group_order: Vec<String> = Vec::new();
-    for (group_name, _svcs) in grouped.iter() {
-        if !group_order.contains(group_name) {
-            group_order.push(group_name.clone());
-        }
-    }
-
-    // Show groups and services with colors
-    let theme = ColorfulTheme::default();
-    eprintln!("\n{}", bold_magenta("─── Services ───"));
-    for gname in &group_order {
-        let indices: Vec<usize> = selection_flat.iter().enumerate()
-            .filter(|(_i, svc)| svc.group == *gname)
-            .map(|(i, _)| i)
-            .collect();
-
-        eprintln!("\n{} {} ({}):", bold_green("▸"), yellow(gname), indices.len());
-        for idx in &indices {
-            let svc = &selection_flat[*idx];
-            let port_display = svc.port.as_deref().unwrap_or("daemon");
-            eprintln!(
-                "  {}",
-                format!(
-                    "[{}] {} {} — {} (port: {}) — {}",
-                    *idx,
-                    magenta(&svc.icon),
-                    green(&svc.name),
-                    svc.desc.chars().take(40).collect::<String>(),
-                    cyan(port_display),
-                    svc.protocol
-                )
-            );
-        }
-    }
+    let selection_flat: Vec<SplashService> = all_services;
 
     let mut checked_indices: Vec<usize> = Vec::new();
     if !selection_flat.is_empty() {
         if has_tty {
-            let options: Vec<String> = selection_flat.iter().enumerate().map(|(i, s)| {
+            // Box for service selection with actual service list
+            let mut svc_lines: Vec<String> = selection_flat.iter().enumerate().map(|(i, s)| {
                 let port_str = s.port.as_deref().unwrap_or("daemon");
-                format!("[{}] {} {} (port: {})", i, s.icon, s.name, port_str)
+                format!("[{}] {} {} — port {}", cyan(&format!("{}", i)), green(&s.icon), yellow(&s.name), cyan(port_str))
             }).collect();
+            svc_lines.push(String::new());
+            svc_lines.push("  use comma-separated indices like 0,2-4".to_string());
+            svc_lines.push("  press Enter to select all".to_string());
+            eprintln!("{}", box_menu("Select Services", &svc_lines));
 
-            eprintln!("\n{}", bold_magenta("─── Select services ───"));
-            eprintln!("{}", green("space=toggle, enter=confirm"));
-            for opt in &options {
-                eprintln!("  {}", opt);
-            }
-
-            let selected = MultiSelect::with_theme(&theme)
-                .items(&options)
-                .defaults(&vec![true; selection_flat.len()][..])
-                .interact()
+            let picked: String = Input::new()
+                .with_prompt("Select service indices")
+                .default(String::from(""))
+                .interact_text()
                 .unwrap_or_default();
 
-            checked_indices = selected.to_vec();
+            if picked.is_empty() {
+                checked_indices = (0..selection_flat.len()).collect();
+            } else {
+                // Parse index ranges like "0,2-4" into Vec<usize>
+                for part in picked.split(',') {
+                    let part = part.trim();
+                    if let Some((lo_str, hi_str)) = part.split_once('-') {
+                        if let (Ok(lo), Ok(hi)) = (lo_str.parse::<usize>(), hi_str.parse::<usize>()) {
+                            for idx in lo..=hi.min(selection_flat.len() - 1) {
+                                if !checked_indices.contains(&idx) {
+                                    checked_indices.push(idx);
+                                }
+                            }
+                        }
+                    } else if let Ok(idx) = part.parse::<usize>() {
+                        if idx < selection_flat.len() && !checked_indices.contains(&idx) {
+                            checked_indices.push(idx);
+                        }
+                    }
+                }
+            }
         } else {
             eprintln!("\n(Non-TTY detected — selecting all {} service(s) by default)", selection_flat.len());
             checked_indices = (0..selection_flat.len()).collect();
         }
     }
 
-    let selected: Vec<SplashService> = checked_indices.iter()
+    let mut selected: Vec<SplashService> = checked_indices.iter()
         .filter_map(|&i| selection_flat.get(i).cloned())
         .collect();
 
@@ -313,37 +527,67 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
     // Determine output directory
     let user_input_dir = config.get_output_dir("./server-splash");
 
-    // Show GUI options
-    let mut selected_gui: Vec<GuiAddon> = Vec::new();
-    if !gui_addons.is_empty() {
-        let gui_options: Vec<String> = gui_addons.iter().map(|g| {
-            format!("{} {} -> :{}", g.icon, g.name, g.src_port)
+    // Ask user which GUI addons to include
+    let mut gui_selection: Vec<SplashService> = Vec::new();
+    if !gui_addons.is_empty() && has_tty {
+        let mut gui_lines: Vec<String> = gui_addons.iter().enumerate().map(|(i, g)| {
+            format!("[{}] {} {} — :{}", cyan(&format!("{}", i)), green(&g.icon), yellow(&g.name), green(&format!("{}", g.src_port)))
         }).collect();
 
-        eprintln!("\n{}", bold_magenta("─── Known GUI addons ───"));
-        eprintln!("{}", green("these will be installed and linked in the splash page"));
-        for opt in &gui_options {
-            eprintln!("  {}", opt);
-        }
+        gui_lines.push(String::new());
+        gui_lines.push("  use comma-separated indices like 0,2-4".to_string());
+        gui_lines.push("  press Enter to select all".to_string());
+        eprintln!("{}", box_menu("Select GUI Addons (optional)", &gui_lines));
 
-        if has_tty {
-            let selected = MultiSelect::with_theme(&theme)
-                .items(&gui_options)
-                .interact()
-                .unwrap_or_default();
-            selected_gui = selected.iter().filter_map(|&i| gui_addons.get(i).cloned()).collect();
-        } else if std::env::var("SPLASH_AUTO_INSTALL_GUI").ok().as_deref() == Some("1") {
-            selected_gui = gui_addons.clone();
+        let picked: String = Input::new()
+            .with_prompt("Select GUI addon indices")
+            .default(String::from(""))
+            .interact_text()
+            .unwrap_or_default();
+
+        if picked.is_empty() {
+            // Select all
+            for g in gui_addons {
+                gui_selection.push(create_gui_service(&g, &hostname));
+            }
         } else {
-            eprintln!("\n(Non-TTY detected — no GUI addons selected. Set SPLASH_AUTO_INSTALL_GUI=1 to include all)");
+            let mut indices: Vec<usize> = Vec::new();
+            for part in picked.split(',') {
+                let part = part.trim();
+                if let Some((lo_str, hi_str)) = part.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) = (lo_str.parse::<usize>(), hi_str.parse::<usize>()) {
+                        for idx in lo..=hi.min(gui_addons.len() - 1) {
+                            if !indices.contains(&idx) {
+                                indices.push(idx);
+                            }
+                        }
+                    }
+                } else if let Ok(idx) = part.parse::<usize>() {
+                    if idx < gui_addons.len() && !indices.contains(&idx) {
+                        indices.push(idx);
+                    }
+                }
+            }
+            for &idx in &indices {
+                if let Some(g) = gui_addons.get(idx) {
+                    gui_selection.push(create_gui_service(g, &hostname));
+                }
+            }
         }
-    };
+    }
 
     eprintln!("\n{}: {}", bold_yellow("Splash page location"), green(&user_input_dir));
 
+    // Check if Ollama Dashboard (GUI addon name "Ollama Dashboard") is selected and reachable.
+    // Only offer the dedicated ollama html page if ollama is available.
+    let ollama_available = crate::agent::is_openai_compatible(&base_url);
+
+    // Merge GUI addon services into the final selection
+    selected.extend(gui_selection);
+
     // 7. Persist config if hostname/agent is set
     let cfg_persist = crate::config::SplashConfig {
-        agent_url: base_url,
+        agent_url: base_url.clone(),
         hostname: Some(hostname.clone()),
         output_dir: Some(user_input_dir.clone()),
         gui_pairs_file: Some(gui_file.to_string_lossy().into_owned()),
@@ -351,12 +595,39 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
     };
     cfg_persist.save_config();
 
+    // Determine Glances API base for GPU stats.
+    // Priority: config > auto-detect from services list > probe localhost ports
+    let glances_from_config = config.glances_api_base.clone();
+    let glances_from_services = selected.iter().find(|s| s.name.to_lowercase().contains("glances"))
+        .map(|s| format!(
+            "http://{}:{}",
+            s.host_override.as_deref().unwrap_or(&hostname),
+            s.port.as_deref().unwrap_or("61208")
+        ));
+
+    let glances_api_base = glances_from_config
+        .or(glances_from_services)
+        .or_else(|| {
+            use reqwest::blocking::Client;
+            let client = Client::new();
+            for probe_port in [61208u16, 6120] {
+                let url = format!("http://127.0.0.1:{probe_port}");
+                if let Ok(resp) = client.get(format!("{url}/api/4/gpu")).send() {
+                    if resp.status().is_success() {
+                        return Some(url);
+                    }
+                }
+            }
+            None
+        });
+
     Ok(WizardOutput {
         output_dir: PathBuf::from(user_input_dir),
         hostname,
         selected_services: selected,
-        gui_addons: selected_gui,
-        glances_api_base: config.glances_api_base.clone(),
+        ollama_dashboard_selected: ollama_available,
+        ollama_port: None,
+        glances_api_base,
     })
 }
 
@@ -613,4 +884,19 @@ fn default_gui_addons() -> Vec<GuiAddon> {
         GuiAddon { name: "Grafana Dashboard".to_string(), src_port: 3001, icon: "📊".to_string() },
         GuiAddon { name: "Glances Monitoring".to_string(), src_port: 6120, icon: "📈".to_string() },
     ]
+}
+
+/// Convert a selected GUI addon into a SplashService entry.
+fn create_gui_service(addon: &GuiAddon, hostname: &str) -> SplashService {
+    SplashService {
+        name: addon.name.clone(),
+        desc: format!("{}:{}", hostname, addon.src_port),
+        icon: addon.icon.clone(),
+        protocol: "http".to_string(),
+        port: Some(addon.src_port.to_string()),
+        host_override: None,
+        base_path: Some("/".to_string()),
+        group: "".to_string(),
+        web_probe_url: None,
+    }
 }
