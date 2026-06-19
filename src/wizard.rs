@@ -119,11 +119,19 @@ fn box_menu(title: &str, items: &[String]) -> String {
 
 fn bold_title(s: &str) -> String { format!("\x1b[1m{}\x1b[0m", s) }
 
+/// Result of probing a single service endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeResult {
+    pub name: String,
+    pub alive: bool,
+}
+
 /// Wizard state produced after user answers all prompts.
 pub(crate) struct WizardOutput {
     pub output_dir: PathBuf,
     pub hostname: String,
     pub selected_services: Vec<SplashService>,
+    pub probe_results: Vec<ProbeResult>,
     pub ollama_dashboard_selected: bool,
     pub ollama_port: Option<u16>,
     pub glances_api_base: Option<String>,
@@ -352,9 +360,8 @@ Rules:
 5. Be concise — 8-16 services max unless genuinely more interesting ones exist
 
 Return ONLY valid JSON. No markdown fences, no explanation."#;
-eprintln!();
-eprintln!("{:<20} {}", bold_yellow("Sending prompt to agent:"), cyan(&system_prompt[..system_prompt.len().min(200)]));
-
+    eprintln!();
+    show_agent_prompt_box(&system_prompt);
 
     // Spawn a background thread to animate a spinner while blocked on HTTP
     let stop_spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -585,6 +592,9 @@ eprintln!("{:<20} {}", bold_yellow("Sending prompt to agent:"), cyan(&system_pro
     // Merge GUI addon services into the final selection
     selected.extend(gui_selection);
 
+    // 6. Probe HTTP endpoints and show status table before generating HTML
+    let probe_results = probe_and_display_services(&selected, &hostname, has_tty);
+
     // 7. Persist config if hostname/agent is set
     let cfg_persist = crate::config::SplashConfig {
         agent_url: base_url.clone(),
@@ -625,14 +635,185 @@ eprintln!("{:<20} {}", bold_yellow("Sending prompt to agent:"), cyan(&system_pro
         output_dir: PathBuf::from(user_input_dir),
         hostname,
         selected_services: selected,
+        probe_results,
         ollama_dashboard_selected: ollama_available,
         ollama_port: None,
         glances_api_base,
     })
 }
 
+/// Run the Python probe script with JSON on stdin.
+/// Table output goes to stderr (inherited TTY), results JSON comes back on stdout.
+fn run_probe_on_tty(script_path: &str, json_input: &str) -> anyhow::Result<String> {
+    let mut child = std::process::Command::new("python3")
+        .arg(script_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn python3: {}", e))?;
+
+    // Write JSON input to stdin
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("Lost stdin"))?;
+        use std::io::Write;
+        stdin.write_all(json_input.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "probe script exited with code {:?}",
+            output.status.code()
+        ));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 from probe: {}", e))
+}
+
+fn probe_and_display_services(
+    services: &[SplashService],
+    hostname: &str,
+    has_tty: bool,
+) -> Vec<ProbeResult> {
+    if services.is_empty() {
+        return Vec::new();
+    }
+
+    // Build JSON payload for Python
+    let svc_vec: Vec<std::collections::HashMap<&str, serde_json::Value>> = services.iter().map(|s| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("name", serde_json::Value::String(s.name.clone()));
+        m.insert("desc", serde_json::Value::String(s.desc.clone()));
+        m.insert("protocol", serde_json::json!(&s.protocol));
+        m.insert("port", serde_json::json!(&s.port));
+        m.insert("host_override", serde_json::json!(&s.host_override));
+        m.insert("base_path", serde_json::json!(&s.base_path));
+        m.insert("web_probe_url", serde_json::json!(&s.web_probe_url));
+        m
+    }).collect();
+
+    let payload = serde_json::json!(svc_vec);
+    let json_input = payload.to_string();
+
+    // Locate the probe script (relative to current dir)
+    let script_path = "scripts/probe_services.py";
+    if !std::path::Path::new(script_path).exists() {
+        eprintln!("  \x1b[1;31mWarning\x1b[0m: {} not found, skipping endpoint probing", script_path);
+        // Return default: all down
+        return services.iter().map(|s| ProbeResult {
+            name: s.name.clone(),
+            alive: false,
+        }).collect();
+    }
+
+    let result_json = match run_probe_on_tty(script_path, &json_input) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  \x1b[1;31mWarning\x1b[0m: probe failed ({})", e);
+            String::new()
+        }
+    };
+
+    // Parse back results
+    let mut probes: Vec<ProbeResult> = Vec::new();
+    if !result_json.trim().is_empty() {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result_json.trim()) {
+            for item in arr {
+                probes.push(ProbeResult {
+                    name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    alive: item.get("alive").and_then(|v| v.as_bool()).unwrap_or(false),
+                });
+            }
+        }
+    }
+
+    // Fallback if Python returned nothing useful
+    if probes.is_empty() {
+        for svc in services {
+            probes.push(ProbeResult {
+                name: svc.name.clone(),
+                alive: false,
+            });
+        }
+    }
+
+    probes
+}
+
 fn bold_cyan(s: &str) -> String { format!("\x1b[1;36m{}\x1b[0m", s) }
 fn bold_red(s: &str) -> String { format!("\x1b[1;31m{}\x1b[0m", s) }
+
+/// Word-wrap text to a given visual width (accounting for emoji/ANSI).
+fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let terminal_width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(80);
+    let wrap_w = max_width.min(terminal_width.saturating_sub(4));
+
+    for paragraph in text.split("\n\n") {
+        let words: Vec<&str> = paragraph.split_whitespace().collect();
+        if words.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current_line = String::new();
+        for word in &words {
+            let display_len = display_w(word);
+            let line_len = display_w(&current_line);
+            if current_line.is_empty() {
+                current_line.push_str(word);
+            } else if line_len + 1 + display_len <= wrap_w {
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                lines.push(current_line.clone());
+                current_line = word.to_string();
+            }
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+        // Blank line between paragraphs
+        if !paragraph.trim().is_empty() {
+            lines.push(String::new());
+        }
+    }
+    lines
+}
+
+/// Print the agent system prompt in a nice bordered box.
+fn show_agent_prompt_box(prompt: &str) {
+    let terminal_width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(80);
+    let box_w = (terminal_width - 4).max(40);
+    let pad_n = |n: usize| " ".repeat(n);
+
+    // Top border
+    eprintln!("\n\x1b[1;33m┌─\x1b[0m{}\x1b[1;33m┐\x1b[0m", "\u{2500}".repeat(box_w));
+
+    // Title row
+    let title = "  Agent System Prompt ";
+    let t_w = display_w(title);
+    let left_pad = (box_w - t_w).max(0) / 2;
+    eprintln!("\x1b[1;33m├─\x1b[0m{}\x1b[1;36m{}\x1b[0m{}\x1b[1;33m┤\x1b[0m", pad_n(left_pad), title, pad_n((box_w - t_w - left_pad).max(0)));
+
+    // Prompt lines
+    let wrapped = word_wrap(prompt, box_w.max(20));
+    for line in &wrapped {
+        let l_w = display_w(line);
+        let r_pad = (box_w - l_w).max(0);
+        eprintln!("\x1b[1;33m│ \x1b[0m\x1b[90m{}\x1b[0m{} \x1b[1;33m│\x1b[0m", line, pad_n(r_pad));
+    }
+
+    // Bottom border
+    eprintln!("\x1b[1;33m└─\x1b[0m{}\x1b[1;33m┘\x1b[0m", "\u{2500}".repeat(box_w));
+}
 
 fn get_hostname() -> Option<String> {
     std::env::var("HOSTNAME").ok().or_else(|| {
