@@ -1,4 +1,5 @@
 /target
 .codegraph
 *.lock
-server-splash
+server-splasih
+.mcp.json

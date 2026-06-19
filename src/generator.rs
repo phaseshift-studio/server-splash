@@ -247,30 +247,19 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     Ok(out_path.to_string_lossy().to_string())
 }
 
-pub(crate) fn generate_ollama_ui(
-    output_dir: &std::path::Path,
-    hostname: &str,
-    port: u16,
-    _glances_port: Option<u16>,
-) -> Result<String, String> {
-    use std::path::PathBuf;
-
-    let mut html = include_str!("ollama-ui/template.html").to_string();
-
-    // Replace placeholders — try hostname_override first, fall back to hostname
-    let hn_esc = esc(hostname).into_owned();
-    for _ in 0..3 {
-        html = html.replace("<!-- HOSTNAME -->", &hn_esc);
-    }
-    html = html.replace("<!-- PORT -->", &port.to_string());
-    html = html.replace(
-        "<!-- GLANCES_PORT -->",
-        &_glances_port.unwrap_or(61208).to_string(),
+/// Inject an "Ollama" link card into the Host Services grid inside the generated HTML.
+pub(crate) fn inject_ollama_card(html: &str, port: u16) -> String {
+    let ollama_card = format!(
+        r#"<a class="card service-card status-up" href="ollama-ui/index.html">
+<span class='status-badge'></span>
+<span class='icon'>🐙</span>
+<div class='info'><span class='name'>Ollama</span><br><span class='desc'>Local LLM inference — models, chat, metrics</span></div>
+<div class='link-wrap'><span class='protocol'>http:</span><span>{port}</span></div>
+</a>"#
     );
 
-    fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
-    let out_path = PathBuf::from(output_dir).join("ollama-dashboard.html");
-    fs::write(&out_path, &html).map_err(|e| format!("Failed to write file: {e}"))?;
-
-    Ok(out_path.to_string_lossy().to_string())
+    html.replace(
+        "<!--GROUP_HOST_SERVICES-->",
+        &format!("{}<!--GROUP_HOST_SERVICES-->", ollama_card),
+    )
 }

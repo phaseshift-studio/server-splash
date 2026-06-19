@@ -3,6 +3,7 @@ mod probe;
 mod wizard;
 mod generator;
 mod agent;
+mod ollama_ui;
 
 fn main() {
     // Print the splash header with color
@@ -42,7 +43,7 @@ fn main() {
         }
     };
 
-    // Generate the HTML splash page
+    // Generate the HTML splash page (writes splash-server.html to disk)
     let spl_path = match generator::generate(&output) {
         Ok(p) => p,
         Err(e) => {
@@ -52,10 +53,18 @@ fn main() {
     };
 
     // Generate the Ollama Dashboard if ollama is available on this host
+    let ollama_port = 11434u16;
     if output.ollama_dashboard_selected {
-        match generator::generate_ollama_ui(&output.output_dir, &output.hostname, 11434, None) {
+        match ollama_ui::generate(&output.output_dir, &output.hostname, ollama_port, None) {
             Ok(path) => println!("Ollama dashboard generated at: {path}"),
             Err(e) => eprintln!("\nError generating ollama dashboard: {e}"),
+        }
+
+        // Also inject an Ollama link card into the splash page
+        let out_path = output.output_dir.join("splash-server.html");
+        if let Ok(splash_content) = std::fs::read_to_string(&out_path) {
+            let with_card = generator::inject_ollama_card(&splash_content, ollama_port);
+            let _ = std::fs::write(&out_path, &with_card);
         }
     }
 
