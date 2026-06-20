@@ -172,7 +172,32 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         html = html.replace("<!-- HOSTNAME -->", &hn);
     }
 
-    // Step 1.5: Replace Glances API URL placeholder
+    // Step 1.5: Replace system info placeholder with static machine card
+    let machine = crate::machine::collect();
+    let total_ram_gb = machine.total_memory_mb as f64 / 1024.0;
+    let disk_pct = if machine.disk_total_gb > 0 {
+        (machine.disk_used_gb as f64 / machine.disk_total_gb as f64 * 100.0) as u8
+    } else { 0 };
+    let system_info_html = format!(
+        r#"<div class="gpu-card">
+  <div class="gpu-header"><span class="gpu-icon">&#x1F4BB;</span> System</div>
+  <div class="gpu-metrics">
+    <div class="gpu-metric"><span class="gpu-label">{os}</span>{ram:.1} GB</div>
+    <div class="gpu-metric"><span class="gpu-label">{cores} cores</span>{kernel}</div>
+    <div class="gpu-metric" style="grid-column:span 2"><span class="gpu-label">Disk</span> {disk_used}/{disk_total} GB ({disk_pct}%)</div>
+  </div>
+</div>"#,
+        os = machine.os.split_whitespace().next().unwrap_or("Linux"),
+        kernel = machine.kernel,
+        cores = machine.cpu_core_count,
+        ram = total_ram_gb,
+        disk_used = machine.disk_used_gb,
+        disk_total = machine.disk_total_gb,
+        disk_pct = disk_pct,
+    );
+    html = html.replace("<!-- SYSTEM_INFO -->", &system_info_html);
+
+    // Step 1.6: Replace Glances API URL placeholder
     let glances_url = output.glances_api_base.as_deref().unwrap_or("http://localhost:61208");
     html = html.replace("<!-- GLANCES_URL -->", glances_url);
 

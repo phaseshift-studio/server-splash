@@ -4,6 +4,7 @@ mod wizard;
 mod generator;
 mod agent;
 mod modules;
+mod machine;
 
 fn main() {
     // Print the splash header with color

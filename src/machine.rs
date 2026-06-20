@@ -8,6 +8,8 @@ pub(crate) struct MachineInfo {
     pub kernel: String,
     pub total_memory_mb: u64,
     pub cpu_core_count: usize,
+    pub disk_total_gb: u64,
+    pub disk_used_gb: u64,
 }
 
 /// Collect machine profile from the host.
@@ -39,6 +41,18 @@ pub(crate) fn collect() -> MachineInfo {
     // CPU cores (logical)
     let cpu_core_count = sys.cpus().len();
 
+    // Disk space — sum across all non-removable mount points
+    let mut disk_total_gb: u64 = 0;
+    let mut disk_used_gb: u64 = 0;
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    for disk in &disks {
+        if disk.is_removable() { continue; }
+        disk_total_gb += disk.total_space() / (1024 * 1024 * 1024);
+        let used = disk.total_space().saturating_sub(disk.available_space());
+        disk_used_gb += used / (1024 * 1024 * 1024);
+    }
+
     MachineInfo {
         hostname: std::env::var("HOSTNAME")
             .ok()
@@ -54,6 +68,8 @@ pub(crate) fn collect() -> MachineInfo {
         kernel: kernel_version,
         total_memory_mb,
         cpu_core_count,
+        disk_total_gb,
+        disk_used_gb,
     }
 }
 
@@ -61,9 +77,4 @@ fn read_line(path: &str) -> Option<Vec<String>> {
     std::fs::read_to_string(path)
         .ok()
         .map(|content| content.lines().take(3).map(String::from).collect())
-}
-
-/// Serialize MachineInfo to JSON for embedding in HTML.
-pub(crate) fn to_json(info: &MachineInfo) -> String {
-    serde_json::to_string(info).unwrap_or_else(|_| "{}".to_string())
 }
