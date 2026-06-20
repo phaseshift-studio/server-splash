@@ -2,6 +2,9 @@
 
 CLI wizard that probes a Linux host, sends results to a local LLM agent for analysis, and generates an HTML dashboard page linking to discovered services. Also generates optional dashboard modules (e.g., Ollama dashboard).
 
+
+![screenshot](screenshot.png)
+
 ## Requirements
 
 - Rust toolchain (edition 2021)
@@ -80,4 +83,3 @@ glances_api_base = "http://localhost:61208"
 
 GUI addons are defined in `services.toml` (TOML format, one entry per service with `src_port` and `icon`).
 
-![screenshot](screenshot.png)
