@@ -1,0 +1,7 @@
+{
+  "name": "Ollama Dashboard",
+  "description": "Local LLM inference dashboard — models, chat, metrics",
+  "default_port": 11434,
+  "icon": "🐙",
+  "url_prefix": "ollama-ui"
+}

@@ -83,11 +83,11 @@ fn box_menu(title: &str, items: &[String]) -> String {
     o.push('\n');
 
     // Title centered
-    let lw = ((w - 4) as i32 - display_w(title).max(1) as i32).max(0) / 2;
+    let lw = ((w - 4) - display_w(title).max(1) as i32).max(0) / 2;
     o.push_str("│ ");
     o.push_str(&pad(lw as usize));
     o.push_str(&bold_title(title));
-    let rw = (w - 4 - lw as i32 - display_w(title).max(1) as i32).max(0);
+    let rw = (w - 4 - lw - display_w(title).max(1) as i32).max(0);
     o.push_str(&pad(rw as usize));
     o.push_str(" │\n");
 
@@ -124,6 +124,19 @@ fn bold_title(s: &str) -> String { format!("\x1b[1m{}\x1b[0m", s) }
 pub(crate) struct ProbeResult {
     pub name: String,
     pub alive: bool,
+    pub icon: String,
+    pub endpoint: String,
+    pub description: String,
+    pub selected: bool,
+}
+
+/// Persistable session state — saved as splash-state.json in the output directory.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct SplashState {
+    hostname: String,
+    services: Vec<SplashService>,
+    selected_modules: Vec<String>,
+    glances_api_base: Option<String>,
 }
 
 /// Wizard state produced after user answers all prompts.
@@ -131,10 +144,10 @@ pub(crate) struct WizardOutput {
     pub output_dir: PathBuf,
     pub hostname: String,
     pub selected_services: Vec<SplashService>,
-    pub probe_results: Vec<ProbeResult>,
-    pub ollama_dashboard_selected: bool,
-    pub ollama_port: Option<u16>,
+    pub _probe_results: Vec<ProbeResult>,
+    pub selected_modules: Vec<String>,
     pub glances_api_base: Option<String>,
+    pub deploy_path: Option<String>,
 }
 
 /// Wrap text into lines of given width. Returns wrapped lines.
@@ -222,7 +235,7 @@ fn draw_grid(title: &str, lines: &[&str], max_lines: usize) -> String {
             out.push_str(line);
             let pad_w = (iw as i32 - 4 - line.len() as i32).max(0) as usize;
             out.push_str(&cell(pad_w));
-            out.push_str("│");
+            out.push('│');
         }
         out.push('\n');
     }
@@ -234,7 +247,7 @@ fn draw_grid(title: &str, lines: &[&str], max_lines: usize) -> String {
             out.push_str("│ ");
             let bare = strip_esc(&msg);
             out.push_str(&bare.chars().take((w as usize) - 4).collect::<String>());
-            out.push_str("\n");
+            out.push('\n');
         } else {
             let pad_w = (w - 4 - display_w(&msg) as i32).max(0) as usize;
             out.push_str("│ ");
@@ -295,7 +308,7 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
             let mut model_lines = Vec::with_capacity(models.len());
             for (i, m) in models.iter().enumerate() {
                 let tag = if i == default_idx { " *(default)" } else { "" };
-                model_lines.push(format!("{} {}{}{}", cyan(&format!("[{i}]")), magenta(m), yellow(tag), format!("\x1b[K")));
+                model_lines.push(format!("{} {}{}\x1b[K", cyan(&format!("[{i}]")), magenta(m), yellow(tag)));
             }
             eprintln!("{}", box_menu("Select Model", &model_lines));
 
@@ -334,10 +347,92 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
     // Build the prompt content (hostname + system_prompt + raw output) that will be sent to agent.
     // Only construct this once just before use so we don't hold a giant string in memory needlessly.
 
-    // 4. Send to agent for analysis and show structured summary of probes used as prompt.
-    eprintln!("\n{}", bold_cyan("Sending to agent for analysis..."));
+    // 4. Determine output directory early (used for cache + final output)
+    let user_input_dir = config.get_output_dir("./server-splash");
+    let cache_path = PathBuf::from(&user_input_dir).join("agent-response.json");
+    let state_path = PathBuf::from(&user_input_dir).join("splash-state.json");
 
-    let system_prompt = r#"You are a Linux system analyst. I will give you raw output from system commands (systemctl list-units, docker ps, free, nvidia-smi, etc.).
+    // Check if a previous session exists and offer to reload it
+    if state_path.exists() && has_tty {
+        eprintln!("\n{} {}",
+            bold_cyan("Previous session found:"),
+            cyan(&state_path.to_string_lossy()));
+        let pick: String = Input::new()
+            .with_prompt("Load previous session? [Y/n]")
+            .default("y".to_string())
+            .interact_text()
+            .unwrap_or_default();
+        if pick.trim().to_lowercase() != "n" {
+            let loaded: SplashState = serde_json::from_str(
+                &std::fs::read_to_string(&state_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read state: {e}"))?
+            )?;
+            eprintln!("{} {} services, {} modules",
+                bold_yellow("Loaded"),
+                loaded.services.len(),
+                loaded.selected_modules.len());
+
+            let mut services = loaded.services.clone();
+            let mut state = loaded.clone();
+            let probe_results = probe_and_display_services(
+                &mut services, &loaded.hostname, has_tty, &mut state, &state_path,
+            );
+
+            // Filter deselected services
+            let keep_names: std::collections::HashSet<&str> = probe_results.iter()
+                .map(|r| r.name.as_str()).collect();
+            services.retain(|s| keep_names.contains(s.name.as_str()));
+
+            // Save final state after edits
+            if let Ok(json) = serde_json::to_string_pretty(&state) {
+                let _ = std::fs::write(&state_path, json);
+            }
+
+            return Ok(WizardOutput {
+                output_dir: PathBuf::from(user_input_dir),
+                hostname: state.hostname.clone(),
+                selected_services: services,
+                _probe_results: probe_results,
+                selected_modules: state.selected_modules,
+                glances_api_base: state.glances_api_base,
+                deploy_path: None,
+            });
+        }
+    }
+
+    let use_cache = if cache_path.exists() {
+        if has_tty {
+            let cached_len = std::fs::metadata(&cache_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            eprintln!("\n{} {} ({} bytes)",
+                bold_cyan("Cached agent response found:"),
+                cyan(&cache_path.to_string_lossy()),
+                cached_len);
+            let pick: String = Input::new()
+                .with_prompt("Use cached response? [Y/n]")
+                .default("y".to_string())
+                .interact_text()
+                .unwrap_or_default();
+            pick.trim().to_lowercase() != "n"
+        } else {
+            true // non-TTY: always use cache
+        }
+    } else {
+        false
+    };
+
+    let analysis_text: String = if use_cache {
+        let cached = std::fs::read_to_string(&cache_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read cached agent response: {e}"))?;
+        eprintln!("{} ({} chars)",
+            bold_yellow("Using cached response"),
+            cached.len());
+        cached
+    } else {
+        eprintln!("\n{}", bold_cyan("Sending to agent for analysis..."));
+
+        let system_prompt = r#"You are a Linux system analyst. I will give you raw output from system commands (systemctl list-units, docker ps, free, nvidia-smi, etc.).
 
 Return a JSON array of services suitable for a server dashboard page. Only include services humans would care about — skip internal/infrastructure noise, skip the agent itself.
 
@@ -360,86 +455,95 @@ Rules:
 5. Be concise — 8-16 services max unless genuinely more interesting ones exist
 
 Return ONLY valid JSON. No markdown fences, no explanation."#;
-    eprintln!();
-    show_agent_prompt_box(&system_prompt);
+        eprintln!();
+        show_agent_prompt_box(system_prompt);
 
-    // Spawn a background thread to animate a spinner while blocked on HTTP
-    let stop_spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let stop = std::sync::Arc::clone(&stop_spin);
-        std::thread::spawn(move || {
-            let frames = ['-', '/', '|', '\\'];
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for &frame in &frames {
-                    print!("\r{:<60}{}", " ", frame);
-                    std::io::stdout().flush().ok();
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+        // Spawn a background thread to animate a spinner while blocked on HTTP
+        let stop_spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let stop = std::sync::Arc::clone(&stop_spin);
+            std::thread::spawn(move || {
+                let frames = ['-', '/', '|', '\\'];
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for &frame in &frames {
+                        print!("\r{:<60}{}", " ", frame);
+                        std::io::stdout().flush().ok();
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
                 }
+            });
+        }
+
+        let prompt_content = format!("{}\n\n{}", hostname, all_output.join("\n"));
+
+        // Increase max_tokens so large probe outputs don't overflow context window
+        const MAX_TOKENS: i32 = 8192;
+
+        let text = {
+            // Re-verify endpoint is still alive — probes took time, Ollama may have unloaded the model
+            if !crate::agent::is_openai_compatible(&base_url) {
+                anyhow::bail!(format!("{}: Agent endpoint {} is no longer reachable after probe collection.",
+                    bold_red("Error"), base_url));
             }
-        });
-    }
 
-    let prompt_content = format!("{}\n\n{}", hostname, all_output.join("\n"));
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?;
 
-    // Increase max_tokens so large probe outputs don't overflow context window
-    const MAX_TOKENS: i32 = 8192;
+            let resp = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": selected_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt_content}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": MAX_TOKENS,
+                }))
+                .send()?;
 
-    let analysis_text = {
-        // Re-verify endpoint is still alive — probes took time, Ollama may have unloaded the model
-        if !crate::agent::is_openai_compatible(&base_url) {
-            anyhow::bail!(format!("{}: Agent endpoint {} is no longer reachable after probe collection.",
-                bold_red("Error"), base_url));
-        }
+            // Always read raw text first — don't rely on .json() directly
+            let body = resp.text()?;
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()?;
+            if body.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Agent returned an empty response. This usually means the input was too large for the model's context window. Try running fewer probe commands."
+                ));
+            }
 
-        let resp = client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .json(&serde_json::json!({
-                "model": selected_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt_content}
-                ],
-                "temperature": 0.2,
-                "max_tokens": MAX_TOKENS,
-            }))
-            .send()?;
+            let parsed: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!(
+                    "Agent returned invalid JSON (first 200 chars): {}\nRaw: {}",
+                    e,
+                    &body[..body.len().min(200)]
+                ))?;
 
-        // Always read raw text first — don't rely on .json() directly
-        let body = resp.text()?;
+            let content = parsed["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Agent returned no message.content. Full response:\n{}",
+                    &body[..body.len().min(1000)]
+                ))?;
 
-        if body.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "Agent returned an empty response. This usually means the input was too large for the model's context window. Try running fewer probe commands."
-            ));
-        }
+            if content.trim().is_empty() {
+                return Err(anyhow::anyhow!("Agent returned empty message content.\nFull response:\n{}", &body));
+            }
 
-        let parsed: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!(
-                "Agent returned invalid JSON (first 200 chars): {}\nRaw: {}",
-                e,
-                &body[..body.len().min(200)]
-            ))?;
+            content.to_string()
+        };
 
-        let content = parsed["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!(
-                "Agent returned no message.content. Full response:\n{}",
-                &body[..body.len().min(1000)]
-            ))?;
+        // Stop spinner before saving/parsing
+        stop_spin.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        if content.trim().is_empty() {
-            return Err(anyhow::anyhow!("Agent returned empty message content.\nFull response:\n{}", &body));
-        }
+        // Save to cache
+        std::fs::create_dir_all(&user_input_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create output dir: {e}"))?;
+        std::fs::write(&cache_path, &text)
+            .map_err(|e| anyhow::anyhow!("Failed to cache agent response: {e}"))?;
 
-        content.to_string()
+        text
     };
-
-    // Stop spinner before parsing (blocking parse)
-    stop_spin.store(true, std::sync::atomic::Ordering::Relaxed);
 
     eprintln!("\n{} {}", bold_yellow("agent analysis"), cyan("(ctrl-o to expand)"));
 
@@ -464,63 +568,11 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
 
     eprintln!("\n{}: {}", bold_yellow("Found"), green(&format!("{} potential service(s)", all_services.len())));
 
-    let selection_flat: Vec<SplashService> = all_services;
+    // All services selected by default; deselection happens in the probe table via 's' key
+    let mut selected: Vec<SplashService> = all_services;
 
-    let mut checked_indices: Vec<usize> = Vec::new();
-    if !selection_flat.is_empty() {
-        if has_tty {
-            // Box for service selection with actual service list
-            let mut svc_lines: Vec<String> = selection_flat.iter().enumerate().map(|(i, s)| {
-                let port_str = s.port.as_deref().unwrap_or("daemon");
-                format!("[{}] {} {} — port {}", cyan(&format!("{}", i)), green(&s.icon), yellow(&s.name), cyan(port_str))
-            }).collect();
-            svc_lines.push(String::new());
-            svc_lines.push("  use comma-separated indices like 0,2-4".to_string());
-            svc_lines.push("  press Enter to select all".to_string());
-            eprintln!("{}", box_menu("Select Services", &svc_lines));
-
-            let picked: String = Input::new()
-                .with_prompt("Select service indices")
-                .default(String::from(""))
-                .interact_text()
-                .unwrap_or_default();
-
-            if picked.is_empty() {
-                checked_indices = (0..selection_flat.len()).collect();
-            } else {
-                // Parse index ranges like "0,2-4" into Vec<usize>
-                for part in picked.split(',') {
-                    let part = part.trim();
-                    if let Some((lo_str, hi_str)) = part.split_once('-') {
-                        if let (Ok(lo), Ok(hi)) = (lo_str.parse::<usize>(), hi_str.parse::<usize>()) {
-                            for idx in lo..=hi.min(selection_flat.len() - 1) {
-                                if !checked_indices.contains(&idx) {
-                                    checked_indices.push(idx);
-                                }
-                            }
-                        }
-                    } else if let Ok(idx) = part.parse::<usize>() {
-                        if idx < selection_flat.len() && !checked_indices.contains(&idx) {
-                            checked_indices.push(idx);
-                        }
-                    }
-                }
-            }
-        } else {
-            eprintln!("\n(Non-TTY detected — selecting all {} service(s) by default)", selection_flat.len());
-            checked_indices = (0..selection_flat.len()).collect();
-        }
-    }
-
-    let mut selected: Vec<SplashService> = checked_indices.iter()
-        .filter_map(|&i| selection_flat.get(i).cloned())
-        .collect();
-
-    if selected.is_empty() {
-        eprintln!("{}", green("No services selected. Generating splash page without services."));
-    } else {
-        eprintln!("\n{}: {}", bold_green("Selected"), red(&format!("{} service(s)", selected.len())));
-    }
+    eprintln!("\n{}: {} (toggle in probe table with 's' key)",
+        bold_green("All services selected"), red(&format!("{} service(s)", selected.len())));
 
     // 6. Gather and display known GUI pairings
     let gui_file = config.gui_pairs_file.as_deref()
@@ -530,9 +582,6 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
                 .join("server-splash/services.toml")
         });
     let gui_addons: Vec<GuiAddon> = load_gui_pairs(&gui_file);
-
-    // Determine output directory
-    let user_input_dir = config.get_output_dir("./server-splash");
 
     // Ask user which GUI addons to include
     let mut gui_selection: Vec<SplashService> = Vec::new();
@@ -585,15 +634,73 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
 
     eprintln!("\n{}: {}", bold_yellow("Splash page location"), green(&user_input_dir));
 
-    // Check if Ollama Dashboard (GUI addon name "Ollama Dashboard") is selected and reachable.
-    // Only offer the dedicated ollama html page if ollama is available.
-    let ollama_available = crate::agent::is_openai_compatible(&base_url);
+    // 5b. Discover and offer dashboard modules from src/modules/
+    let available_modules = crate::modules::all_modules();
+    let mut selected_module_names: Vec<String> = Vec::new();
+    if !available_modules.is_empty() && has_tty {
+        let mut mod_lines: Vec<String> = available_modules.iter().enumerate().map(|(i, m)| {
+            format!("[{}] {} {} — :{}  {}", cyan(&format!("{}", i)), green(&m.icon), yellow(&m.name), green(&format!("{}", m.default_port)), m.description)
+        }).collect();
+        mod_lines.push(String::new());
+        mod_lines.push("  use comma-separated indices like 0,2-4".to_string());
+        mod_lines.push("  press Enter to select all".to_string());
+        eprintln!("{}", box_menu("Select Dashboard Modules (optional)", &mod_lines));
+
+        let picked: String = Input::new()
+            .with_prompt("Select module indices")
+            .default(String::from(""))
+            .interact_text()
+            .unwrap_or_default();
+
+        if picked.is_empty() {
+            for m in &available_modules {
+                selected_module_names.push(m.name.clone());
+            }
+        } else {
+            let mut indices: Vec<usize> = Vec::new();
+            for part in picked.split(',') {
+                let part = part.trim();
+                if let Some((lo_str, hi_str)) = part.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) = (lo_str.parse::<usize>(), hi_str.parse::<usize>()) {
+                        for idx in lo..=hi.min(available_modules.len() - 1) {
+                            if !indices.contains(&idx) {
+                                indices.push(idx);
+                            }
+                        }
+                    }
+                } else if let Ok(idx) = part.parse::<usize>() {
+                    if idx < available_modules.len() && !indices.contains(&idx) {
+                        indices.push(idx);
+                    }
+                }
+            }
+            for &idx in &indices {
+                if let Some(m) = available_modules.get(idx) {
+                    selected_module_names.push(m.name.clone());
+                }
+            }
+        }
+    }
 
     // Merge GUI addon services into the final selection
     selected.extend(gui_selection);
 
     // 6. Probe HTTP endpoints and show status table before generating HTML
-    let probe_results = probe_and_display_services(&selected, &hostname, has_tty);
+    let state_path = PathBuf::from(&user_input_dir).join("splash-state.json");
+    let mut state = SplashState {
+        hostname: hostname.clone(),
+        services: selected.clone(),
+        selected_modules: selected_module_names.clone(),
+        glances_api_base: None, // filled in below
+    };
+    let probe_results = probe_and_display_services(
+        &mut selected, &hostname, has_tty, &mut state, &state_path,
+    );
+
+    // Filter deselected services from the final list
+    let keep_names: std::collections::HashSet<&str> = probe_results.iter()
+        .map(|r| r.name.as_str()).collect();
+    selected.retain(|s| keep_names.contains(s.name.as_str()));
 
     // 7. Persist config if hostname/agent is set
     let cfg_persist = crate::config::SplashConfig {
@@ -631,115 +738,468 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
             None
         });
 
+    // Save final state after all edits
+    state.glances_api_base = glances_api_base.clone();
+    state.services = selected.clone();
+    state.selected_modules = selected_module_names.clone();
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = std::fs::write(&state_path, json);
+    }
+
+    // 8. Ask where to deploy
+    let deploy_path = if has_tty {
+        let www = "/var/www/html";
+        let has_www = std::path::Path::new(www).is_dir();
+
+        eprintln!("\n{}", bold_cyan("Deployment"));
+        eprintln!("  [0] {} (keep files in place)", cyan(&user_input_dir));
+        if has_www {
+            eprintln!("  [1] {} (standard web root)", cyan(www));
+        }
+        let custom_n = if has_www { 2 } else { 1 };
+        let skip_n = custom_n + 1;
+        eprintln!("  [{}] Custom path...", custom_n);
+        eprintln!("  [{}] Skip deployment", skip_n);
+        eprintln!();
+
+        let default = String::from("0");
+        let pick: String = Input::new()
+            .with_prompt("Choose deploy target")
+            .default(default)
+            .interact_text()
+            .unwrap_or_default();
+
+        match pick.trim() {
+            "0" => Some(user_input_dir.clone()),
+            "1" if has_www => Some(www.to_string()),
+            n if n.parse::<usize>().is_ok() => {
+                let idx: usize = n.parse().unwrap();
+                if idx == custom_n {
+                    let custom: String = Input::new()
+                        .with_prompt("Enter deploy path")
+                        .interact_text()
+                        .unwrap_or_default();
+                    if custom.is_empty() { None } else { Some(custom) }
+                } else if idx == skip_n {
+                    None
+                } else {
+                    Some(user_input_dir.clone())
+                }
+            }
+            _ => Some(user_input_dir.clone()),
+        }
+    } else {
+        None
+    };
+
     Ok(WizardOutput {
         output_dir: PathBuf::from(user_input_dir),
         hostname,
         selected_services: selected,
-        probe_results,
-        ollama_dashboard_selected: ollama_available,
-        ollama_port: None,
+        _probe_results: probe_results,
+        selected_modules: selected_module_names,
         glances_api_base,
+        deploy_path,
     })
 }
 
-/// Run the Python probe script with JSON on stdin.
-/// Table output goes to stderr (inherited TTY), results JSON comes back on stdout.
-fn run_probe_on_tty(script_path: &str, json_input: &str) -> anyhow::Result<String> {
-    let mut child = std::process::Command::new("python3")
-        .arg(script_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn python3: {}", e))?;
+/// Build an HTTP probe URL for a service. Returns None for non-HTTP services.
+fn build_probe_url(svc: &SplashService, hostname: &str) -> Option<String> {
+    if let Some(ref wp) = svc.web_probe_url {
+        if !wp.is_empty() && wp.to_lowercase() != "none" {
+            return Some(wp.clone());
+        }
+    }
+    let port = svc.port.as_deref()?;
+    let protocol = svc.protocol.to_lowercase();
+    if matches!(protocol.as_str(), "ssh" | "vnc" | "mqtt" | "ws") {
+        return None;
+    }
+    let host = svc.host_override.as_deref().unwrap_or(hostname);
+    let bp = svc.base_path.as_deref().unwrap_or("");
+    Some(format!("http://{}:{}{}", host, port, bp))
+}
 
-    // Write JSON input to stdin
+/// Probe a single HTTP endpoint with a 3-second timeout.
+fn probe_http(url: &str) -> bool {
+    use reqwest::blocking::Client;
+    let client = match Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
     {
-        let stdin = child.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("Lost stdin"))?;
-        use std::io::Write;
-        stdin.write_all(json_input.as_bytes())?;
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(url).send() {
+        Ok(resp) => resp.status().is_success() || resp.status().is_redirection(),
+        Err(_) => false,
+    }
+}
+
+/// Read a line of input with the given initial text pre-filled for inline editing.
+fn read_line_with_initial(prompt: &str, initial: &str) -> String {
+    use console::Term;
+    let term = Term::stderr();
+
+    let mut buf: Vec<char> = initial.chars().collect();
+    let mut pos = buf.len();
+
+    eprint!("  {}: ", prompt);
+
+    // Redraw helper: clear line, print prompt + buffer, position cursor
+    let redraw = |buf: &[char], pos: usize| {
+        eprint!("\r\x1b[K  {}: {}", prompt, buf.iter().collect::<String>());
+        // Move cursor back to pos within the content
+        let back = buf.len().saturating_sub(pos);
+        if back > 0 {
+            eprint!("\x1b[{}D", back);
+        }
+    };
+
+    redraw(&buf, pos);
+
+    loop {
+        match term.read_key() {
+            Ok(console::Key::Enter) => {
+                eprintln!();
+                break;
+            }
+            Ok(console::Key::Char(c)) => {
+                buf.insert(pos, c);
+                pos += 1;
+                redraw(&buf, pos);
+            }
+            Ok(console::Key::Backspace) => {
+                if pos > 0 {
+                    pos -= 1;
+                    buf.remove(pos);
+                    redraw(&buf, pos);
+                }
+            }
+            Ok(console::Key::ArrowLeft) => {
+                if pos > 0 {
+                    pos -= 1;
+                    redraw(&buf, pos);
+                }
+            }
+            Ok(console::Key::ArrowRight) => {
+                if pos < buf.len() {
+                    pos += 1;
+                    redraw(&buf, pos);
+                }
+            }
+            Ok(console::Key::Home) => {
+                pos = 0;
+                redraw(&buf, pos);
+            }
+            Ok(console::Key::End) => {
+                pos = buf.len();
+                redraw(&buf, pos);
+            }
+            Ok(console::Key::Escape) => {
+                eprintln!();
+                return initial.to_string();
+            }
+            _ => {}
+        }
     }
 
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "probe script exited with code {:?}",
-            output.status.code()
-        ));
+    buf.into_iter().collect()
+}
+
+/// Display a formatted table of probe results. Returns the number of lines output.
+/// Display a formatted table of probe results. Returns the number of lines output.
+/// highlight col mapping: 0=inc, 1=icon, 2=name, 3=endpoint, 4=desc  (STATUS is not navigable)
+fn display_probe_table(results: &[ProbeResult], highlight: Option<(usize, u8)>) -> usize {
+    if results.is_empty() { return 0; }
+
+    let term_w = std::env::var("COLUMNS")
+        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(80);
+
+    let w_status = 10usize;
+    let w_inc = 3usize;
+    let w_icon = 4usize;
+    // 7 │ separators + fixed columns = 24 chars overhead; remaining split 3 ways
+    let flex = term_w.saturating_sub(24).max(30);
+    let w_name = results.iter().map(|r| display_w(&r.name)).max().unwrap_or(0)
+        .clamp(10, flex * 25 / 100).max(10);
+    let w_ep = results.iter().map(|r| display_w(&r.endpoint)).max().unwrap_or(0)
+        .clamp(16, flex * 40 / 100).max(16);
+    let w_desc = results.iter().map(|r| display_w(&r.description)).max().unwrap_or(0)
+        .clamp(12, flex * 35 / 100).max(12);
+
+    // Cell helpers: produce a string of exactly `w` visible characters.
+    // ANSI escapes are preserved but don't count toward visual width.
+    let cell_r = |s: &str, w: usize| -> String {
+        let dw = display_w(s).min(w);
+        format!("{}{}", " ".repeat(w - dw), s)
+    };
+    let cell_l = |s: &str, w: usize| -> String {
+        let dw = display_w(s).min(w);
+        format!("{}{}", s, " ".repeat(w - dw))
+    };
+    let cell_hl = |inner: &str, is_hl: bool| -> String {
+        if is_hl { format!("\x1b[7m{}\x1b[0m", inner) } else { inner.to_string() }
+    };
+
+    let dash = |w: usize| "─".repeat(w);
+    let top = format!("┌{}┬{}┬{}┬{}┬{}┬{}┐",
+        dash(w_status), dash(w_inc), dash(w_icon), dash(w_name), dash(w_ep), dash(w_desc));
+    let sep = format!("├{}┼{}┼{}┼{}┼{}┼{}┤",
+        dash(w_status), dash(w_inc), dash(w_icon), dash(w_name), dash(w_ep), dash(w_desc));
+    let bot = format!("└{}┴{}┴{}┴{}┴{}┴{}┘",
+        dash(w_status), dash(w_inc), dash(w_icon), dash(w_name), dash(w_ep), dash(w_desc));
+
+    eprintln!();
+    eprintln!("{}", yellow(&top));
+
+    eprintln!("│{}│{}│{}│{}│{}│{}│",
+        cell_r(&cyan("STATUS"), w_status),
+        cell_l("INC", w_inc),
+        cell_l("ICON", w_icon),
+        cell_l(&cyan("NAME"), w_name),
+        cell_l("ENDPOINT", w_ep),
+        cell_l("DESC", w_desc),
+    );
+
+    eprintln!("{}", yellow(&sep));
+
+    for (i, r) in results.iter().enumerate() {
+        let inc = if r.selected { " \u{2714} " } else { "   " };
+        let status = if r.alive {
+            cell_r(&bold_green("alive"), w_status)
+        } else {
+            cell_r(&bold_red("down"), w_status)
+        };
+        let hl_inc = highlight.is_some_and(|(row, col)| row == i && col == 0);
+        let hl_icon = highlight.is_some_and(|(row, col)| row == i && col == 1);
+        let hl_name = highlight.is_some_and(|(row, col)| row == i && col == 2);
+        let hl_ep = highlight.is_some_and(|(row, col)| row == i && col == 3);
+        let hl_desc = highlight.is_some_and(|(row, col)| row == i && col == 4);
+
+        eprintln!("│{}│{}│{}│{}│{}│{}│",
+            // STATUS column is not editable — never highlighted
+            status,
+            cell_hl(&cell_l(inc, w_inc), hl_inc),
+            cell_hl(&cell_l(&r.icon, w_icon), hl_icon),
+            cell_hl(&cell_l(&r.name, w_name), hl_name),
+            cell_hl(&cell_l(&r.endpoint, w_ep), hl_ep),
+            cell_hl(&cell_l(&r.description, w_desc), hl_desc),
+        );
+        if i < results.len() - 1 {
+            eprintln!("{}", yellow(&sep));
+        }
     }
 
-    String::from_utf8(output.stdout)
-        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 from probe: {}", e))
+    eprintln!("{}", yellow(&bot));
+
+    let selected = results.iter().filter(|r| r.selected).count();
+    let alive = results.iter().filter(|r| r.alive).count();
+    eprintln!("  {}/{} selected, {}/{} reachable", selected, results.len(), alive, results.len());
+
+    // line count: blank + top + header + sep + (data*2 - 1) + bot + summary
+    3 + results.len() * 2
+}
+
+/// Interactive TUI editor for the probe results table.
+/// Saves splash-state.json after each edit so edits persist across runs.
+fn edit_probe_table(
+    results: &mut [ProbeResult],
+    services: &mut [SplashService],
+    state: &mut SplashState,
+    state_path: &Path,
+) {
+    use console::Term;
+
+    let term = match Term::stdout().read_key() {
+        Ok(_) => Term::stdout(),
+        Err(_) => return, // not a TTY
+    };
+
+    let mut row: usize = 0;
+    let mut col: u8 = 0; // 0=inc, 1=icon, 2=name, 3=endpoint, 4=desc (5 navigable columns)
+
+    loop {
+        // Save cursor, clear below, redraw
+        eprint!("\x1b[s\x1b[J");
+        display_probe_table(results, Some((row, col)));
+        eprintln!("\n  \x1b[90m[↑↓/jk] nav  [←→/tab] field  [enter] edit  [s] toggle  [a] all  [q] done\x1b[0m");
+
+        match term.read_key() {
+            Ok(console::Key::ArrowUp) | Ok(console::Key::Char('k')) => {
+                row = row.saturating_sub(1);
+            }
+            Ok(console::Key::ArrowDown) | Ok(console::Key::Char('j')) => {
+                if row + 1 < results.len() { row += 1; }
+            }
+            Ok(console::Key::ArrowLeft) | Ok(console::Key::Char('h')) => {
+                if col == 0 { col = 4; } else { col -= 1; }
+            }
+            Ok(console::Key::ArrowRight) | Ok(console::Key::Char('l'))
+            | Ok(console::Key::Tab) => {
+                col = (col + 1) % 5;
+            }
+            Ok(console::Key::Char('s')) => {
+                results[row].selected = !results[row].selected;
+                state.services = services.to_vec();
+                if let Ok(json) = serde_json::to_string_pretty(&state) {
+                    let _ = std::fs::write(state_path, json);
+                }
+            }
+            Ok(console::Key::Char('a')) => {
+                for r in results.iter_mut() { r.selected = true; }
+                state.services = services.to_vec();
+                if let Ok(json) = serde_json::to_string_pretty(&state) {
+                    let _ = std::fs::write(state_path, json);
+                }
+            }
+            Ok(console::Key::Enter) => {
+                if col == 0 {
+                    // INC column: toggle selection
+                    results[row].selected = !results[row].selected;
+                    state.services = services.to_vec();
+                    if let Ok(json) = serde_json::to_string_pretty(&state) {
+                        let _ = std::fs::write(state_path, json);
+                    }
+                } else if col == 1 {
+                    // Icon: show palette, let user pick or type custom
+                    eprint!("\x1b[J");
+                    let palette = [
+                        "🤖","🐳","🖥️","📊","📈","🔀","🐙","🗄️","📁","🎮",
+                        "🎵","📹","🔒","🗃️","🌐","🛠️","📝","💾","🖨️","🖼️",
+                        "📡","🔧","📋","🏠","⚙️","🔐","🔗","📨","🗂️","💻",
+                    ];
+                    eprintln!("  Icon palette:");
+                    for (i, chunk) in palette.chunks(10).enumerate() {
+                        eprintln!("  {}",
+                            chunk.iter().enumerate()
+                                .map(|(j, icon)| format!("[{}]{}", i * 10 + j, icon))
+                                .collect::<Vec<_>>().join(" "));
+                    }
+                    eprint!("\n  Current: {}  Pick index or type custom icon: ", results[row].icon);
+                    std::io::stdout().flush().ok();
+
+                    let mut pick = String::new();
+                    let _ = std::io::stdin().read_line(&mut pick);
+                    let pick = pick.trim().to_string();
+
+                    let new_icon = if let Ok(idx) = pick.parse::<usize>() {
+                        palette.get(idx).map(|s| s.to_string()).unwrap_or(pick)
+                    } else if pick.is_empty() {
+                        results[row].icon.clone()
+                    } else {
+                        pick
+                    };
+
+                    if !new_icon.is_empty() {
+                        results[row].icon = new_icon.clone();
+                        services[row].icon = new_icon;
+                        state.services = services.to_vec();
+                        if let Ok(json) = serde_json::to_string_pretty(&state) {
+                            let _ = std::fs::write(state_path, json);
+                        }
+                    }
+                } else {
+                    let (prompt, current) = match col {
+                        2 => ("New name", results[row].name.clone()),
+                        3 => ("New endpoint URL", results[row].endpoint.clone()),
+                        4 => ("New description", results[row].description.clone()),
+                        _ => continue,
+                    };
+
+                    // Clear the help bar, show prompt with current value as pre-filled input
+                    eprint!("\x1b[J");
+
+                    let new_val = read_line_with_initial(prompt, &current);
+
+                    if !new_val.is_empty() {
+                        match col {
+                            2 => {
+                                results[row].name = new_val.clone();
+                                services[row].name = new_val;
+                            }
+                            3 => {
+                                results[row].endpoint = new_val.clone();
+                                results[row].alive = if new_val != "n/a" {
+                                    eprint!(".");
+                                    probe_http(&new_val)
+                                } else {
+                                    false
+                                };
+                                services[row].web_probe_url = Some(new_val);
+                            }
+                            4 => {
+                                results[row].description = new_val.clone();
+                                services[row].desc = new_val;
+                            }
+                            _ => {}
+                        }
+                        // Persist edits to splash-state.json
+                        state.services = services.to_vec();
+                        if let Ok(json) = serde_json::to_string_pretty(&state) {
+                            let _ = std::fs::write(state_path, json);
+                        }
+                    }
+                }
+            }
+            Ok(console::Key::Char('q')) | Ok(console::Key::Escape) => break,
+            _ => {}
+        }
+    }
+
+    // Final cleanup: clear the interactive table and draw the final static version
+    eprint!("\x1b[s\x1b[J");
+    display_probe_table(results, None);
 }
 
 fn probe_and_display_services(
-    services: &[SplashService],
+    services: &mut [SplashService],
     hostname: &str,
     has_tty: bool,
+    state: &mut SplashState,
+    state_path: &Path,
 ) -> Vec<ProbeResult> {
     if services.is_empty() {
         return Vec::new();
     }
 
-    // Build JSON payload for Python
-    let svc_vec: Vec<std::collections::HashMap<&str, serde_json::Value>> = services.iter().map(|s| {
-        let mut m = std::collections::HashMap::new();
-        m.insert("name", serde_json::Value::String(s.name.clone()));
-        m.insert("desc", serde_json::Value::String(s.desc.clone()));
-        m.insert("protocol", serde_json::json!(&s.protocol));
-        m.insert("port", serde_json::json!(&s.port));
-        m.insert("host_override", serde_json::json!(&s.host_override));
-        m.insert("base_path", serde_json::json!(&s.base_path));
-        m.insert("web_probe_url", serde_json::json!(&s.web_probe_url));
-        m
-    }).collect();
+    eprintln!("\n{}", bold_cyan("Probing service endpoints..."));
 
-    let payload = serde_json::json!(svc_vec);
-    let json_input = payload.to_string();
+    let mut results: Vec<ProbeResult> = Vec::with_capacity(services.len());
 
-    // Locate the probe script (relative to current dir)
-    let script_path = "scripts/probe_services.py";
-    if !std::path::Path::new(script_path).exists() {
-        eprintln!("  \x1b[1;31mWarning\x1b[0m: {} not found, skipping endpoint probing", script_path);
-        // Return default: all down
-        return services.iter().map(|s| ProbeResult {
-            name: s.name.clone(),
-            alive: false,
-        }).collect();
+    for svc in services.iter() {
+        let url = build_probe_url(svc, hostname);
+        let endpoint = url.clone().unwrap_or_else(|| "n/a".to_string());
+
+        let alive = if let Some(u) = url.as_ref() {
+            eprint!(".");
+            std::io::stdout().flush().ok();
+            probe_http(u)
+        } else {
+            false
+        };
+
+        results.push(ProbeResult {
+            name: svc.name.clone(),
+            alive,
+            icon: svc.icon.clone(),
+            endpoint,
+            description: svc.desc.clone(),
+            selected: true,
+        });
+    }
+    eprintln!();
+
+    display_probe_table(&results, None);
+
+    if has_tty {
+        edit_probe_table(&mut results, services, state, state_path);
+
+        // Filter deselected out of the results list (caller filters services by name)
+        results.retain(|r| r.selected);
     }
 
-    let result_json = match run_probe_on_tty(script_path, &json_input) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("  \x1b[1;31mWarning\x1b[0m: probe failed ({})", e);
-            String::new()
-        }
-    };
-
-    // Parse back results
-    let mut probes: Vec<ProbeResult> = Vec::new();
-    if !result_json.trim().is_empty() {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result_json.trim()) {
-            for item in arr {
-                probes.push(ProbeResult {
-                    name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    alive: item.get("alive").and_then(|v| v.as_bool()).unwrap_or(false),
-                });
-            }
-        }
-    }
-
-    // Fallback if Python returned nothing useful
-    if probes.is_empty() {
-        for svc in services {
-            probes.push(ProbeResult {
-                name: svc.name.clone(),
-                alive: false,
-            });
-        }
-    }
-
-    probes
+    results
 }
 
 fn bold_cyan(s: &str) -> String { format!("\x1b[1;36m{}\x1b[0m", s) }
@@ -795,24 +1255,24 @@ fn show_agent_prompt_box(prompt: &str) {
     let pad_n = |n: usize| " ".repeat(n);
 
     // Top border
-    eprintln!("\n\x1b[1;33m┌─\x1b[0m{}\x1b[1;33m┐\x1b[0m", "\u{2500}".repeat(box_w));
+    eprintln!("\n\x1b[1;33m┌─\x1b[0m{}\x1b[1;33m┐\x1b[0m", "\u{2500}".repeat(box_w + 1));
 
     // Title row
     let title = "  Agent System Prompt ";
     let t_w = display_w(title);
-    let left_pad = (box_w - t_w).max(0) / 2;
-    eprintln!("\x1b[1;33m├─\x1b[0m{}\x1b[1;36m{}\x1b[0m{}\x1b[1;33m┤\x1b[0m", pad_n(left_pad), title, pad_n((box_w - t_w - left_pad).max(0)));
+    let left_pad = (box_w - t_w) / 2;
+    eprintln!("\x1b[1;33m├─\x1b[0m{}\x1b[1;36m{}\x1b[0m{}\x1b[1;33m┤\x1b[0m", pad_n(left_pad), title, pad_n(box_w - t_w - left_pad + 1));
 
     // Prompt lines
     let wrapped = word_wrap(prompt, box_w.max(20));
     for line in &wrapped {
         let l_w = display_w(line);
-        let r_pad = (box_w - l_w).max(0);
+        let r_pad = box_w - l_w;
         eprintln!("\x1b[1;33m│ \x1b[0m\x1b[90m{}\x1b[0m{} \x1b[1;33m│\x1b[0m", line, pad_n(r_pad));
     }
 
     // Bottom border
-    eprintln!("\x1b[1;33m└─\x1b[0m{}\x1b[1;33m┘\x1b[0m", "\u{2500}".repeat(box_w));
+    eprintln!("\x1b[1;33m└─\x1b[0m{}\x1b[1;33m┘\x1b[0m", "\u{2500}".repeat(box_w + 1));
 }
 
 fn get_hostname() -> Option<String> {
@@ -975,7 +1435,7 @@ fn parse_agent_json(text: &str) -> anyhow::Result<Vec<SplashService>> {
             let rest_no = &stripped[idx..];
             if let Some(after_colon) = rest_no.find(':') {
                 let maybe_arr = &rest_no[after_colon + 1..];
-                let start = maybe_arr.find('[').map(|i| i).unwrap_or(0);
+                let start = maybe_arr.find('[').unwrap_or(0);
                 let end_idx = maybe_arr.find(']').map(|i| i + 1).unwrap_or(maybe_arr.len());
                 if let Some(arr_str) = maybe_arr.get(start..end_idx) {
                     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(arr_str) {

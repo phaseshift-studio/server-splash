@@ -57,7 +57,7 @@ fn render_right(svc: &SplashService) -> String {
 fn card_href(svc: &SplashService, hostname: &str) -> String {
     let port = svc.port.as_deref().unwrap_or("");
     if port.is_empty() { return String::new(); }
-    let host = esc(&svc.host_override.as_deref().unwrap_or(hostname));
+    let host = esc(svc.host_override.as_deref().unwrap_or(hostname));
     let bp = esc(svc.base_path.as_deref().unwrap_or(""));
     match svc.protocol.to_lowercase().as_str() {
         "ssh" => format!("ssh://{}:{}{}", host, port, bp),
@@ -68,7 +68,7 @@ fn card_href(svc: &SplashService, hostname: &str) -> String {
 
 fn click_handler(svc: &SplashService) -> Option<String> {
     if svc.protocol.to_lowercase().as_str() == "ssh" {
-        Some(format!("logsmodal('SSH Server')"))
+        Some("logsmodal('SSH Server')".to_string())
     } else if svc.port.is_some() {
         let href = card_href(svc, "");
         Some(format!("openservice('{}')", esc(&href)))
@@ -95,8 +95,8 @@ fn render_card(svc: &SplashService, hostname: &str) -> String {
             format!(r#"data-probe="{}""#, esc(url))
         } else { String::new() }
     } else if svc.port.is_some() {
-        let h = esc(&svc.host_override.as_deref().unwrap_or(hostname));
-        let p = svc.port.as_ref().map(|x| x.as_str()).unwrap_or("");
+        let h = esc(svc.host_override.as_deref().unwrap_or(hostname));
+        let p = svc.port.as_deref().unwrap_or("");
         format!(r#"data-probe="http://{}:{}""#, esc(&h), esc(p))
     } else { String::new() };
 
@@ -105,7 +105,7 @@ fn render_card(svc: &SplashService, hostname: &str) -> String {
     let card_tag = if !href_val.is_empty() { "a" } else { "div" };
 
     let mut c = String::new();
-    c.push_str("<");
+    c.push('<');
     c.push_str(card_tag);
     c.push_str(" class=\"card service-card ");
     c.push_str(status_cls);
@@ -236,7 +236,7 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         .unwrap_or_else(|| "*".to_string());
 
     let footer = format!("{} {} {} | powered by server-splash", output.hostname, "\u{2014}", ip_display);
-    html = html.replace("<!-- FOOTER -->", &esc(&footer).into_owned());
+    html = html.replace("<!-- FOOTER -->", &esc(&footer));
 
     // Step 5: Write to disk
     let out_dir = output.output_dir.clone();
@@ -247,19 +247,20 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     Ok(out_path.to_string_lossy().to_string())
 }
 
-/// Inject an "Ollama" link card into the Host Services grid inside the generated HTML.
-pub(crate) fn inject_ollama_card(html: &str, port: u16) -> String {
-    let ollama_card = format!(
-        r#"<a class="card service-card status-up" href="ollama-ui/index.html">
+/// Build an HTML link card for a dashboard module to inject into the splash page.
+pub(crate) fn module_card(
+    url_prefix: &str,
+    icon: &str,
+    name: &str,
+    desc: &str,
+    port: u16,
+) -> String {
+    format!(
+        r#"<a class="card service-card status-up" href="{url_prefix}/index.html">
 <span class='status-badge'></span>
-<span class='icon'>🐙</span>
-<div class='info'><span class='name'>Ollama</span><br><span class='desc'>Local LLM inference — models, chat, metrics</span></div>
+<span class='icon'>{icon}</span>
+<div class='info'><span class='name'>{name}</span><br><span class='desc'>{desc}</span></div>
 <div class='link-wrap'><span class='protocol'>http:</span><span>{port}</span></div>
 </a>"#
-    );
-
-    html.replace(
-        "<!--GROUP_HOST_SERVICES-->",
-        &format!("{}<!--GROUP_HOST_SERVICES-->", ollama_card),
     )
 }
