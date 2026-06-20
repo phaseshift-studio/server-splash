@@ -233,10 +233,8 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     // Insert custom sections before footer if any exist
     if !custom_sections.is_empty() {
         let combined: String = custom_sections.join("");
-        let footer_placeholder = format!("\n{}</div>\n<!-- FOOTER -->", combined);
-        html = html.replace("<!-- FOOTER -->", &footer_placeholder);
+        html = html.replace("<!-- FOOTER -->", &format!("\n{}\n<!-- FOOTER -->", combined));
     }
-
     // Step 3: Fill title and IP from splash-meta.json
     let meta_path = output.output_dir.join("splash-meta.json");
     if let Ok(raw) = fs::read_to_string(&meta_path) {
@@ -279,6 +277,7 @@ pub(crate) fn module_card(
     name: &str,
     desc: &str,
     port: u16,
+    service_port: u16
 ) -> String {
     format!(
         r#"<a class="card service-card status-up" href="{url_prefix}/index.html">

@@ -1,0 +1,8 @@
+{
+  "name": "systemd",
+  "description": "Systemctl service management panel",
+  "default_port": 9870,
+  "default_service_port": 9870,
+  "icon": "⚙️",
+  "url_prefix": "systemd"
+}

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Systemd Dashboard — <!-- HOSTNAME --></title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<h1>&#x2699;&#xFE0F; Systemd Dashboard</h1>
+<p class="subtitle"><!-- HOSTNAME --> &mdash; service management &mdash; <strong>:<!-- PORT --></strong></p>
+
+<div class="controls-bar">
+  <input type="text" id="search" placeholder="Search services..." oninput="renderUnits()">
+  <select id="filter-state" onchange="renderUnits()">
+    <option value="all">All states</option>
+    <option value="active">Active (running)</option>
+    <option value="inactive">Inactive (stopped)</option>
+    <option value="failed">Failed</option>
+    <option value="enabled">Enabled</option>
+    <option value="disabled">Disabled</option>
+  </select>
+  <button id="refresh-btn" onclick="loadUnits()">Refresh</button>
+  <label><input type="checkbox" id="auto-refresh" checked onchange="toggleAutoRefresh()"> Auto 10s</label>
+</div>
+
+<h2>Units</h2>
+<div class="unit-grid" id="unit-grid">Loading...</div>
+
+<h2>Command Log</h2>
+<div class="cmd-log-header">
+  <span style="color:var(--dim);font-size:.8rem">All systemctl commands executed</span>
+  <button id="clear-log" onclick="clearLog()">Clear</button>
+</div>
+<div id="cmd-log"></div>
+
+<!-- Edit Modal -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <h3 id="modal-title">Edit Unit File</h3>
+    <div class="path" id="modal-path"></div>
+    <textarea id="modal-content" spellcheck="false"></textarea>
+    <div class="modal-actions">
+      <button class="cancel-btn" onclick="closeModal()">Cancel</button>
+      <button class="save-btn" onclick="saveUnit()">Save & daemon-reload</button>
+    </div>
+  </div>
+</div>
+
+<footer><!-- HOSTNAME --> &mdash; Systemd Dashboard</footer>
+
+<script>
+const API = 'http://<!-- HOSTNAME -->:<!-- PORT -->';
+let allUnits = [];
+let autoRefreshTimer = null;
+let editingUnit = null;
+
+function statusClass(active, sub) {
+  if (active === 'active' || active === 'running') return 'running';
+  if (active === 'failed' || sub === 'failed') return 'failed';
+  return 'inactive';
+}
+
+function statusLabel(active, sub) {
+  if (active === 'active' || active === 'running') return '\u25cf ACTIVE';
+  if (active === 'failed' || sub === 'failed') return '\u2715 FAILED';
+  return '\u25cb INACTIVE';
+}
+
+function enabledLabel(enabled) {
+  if (enabled === 'enabled' || enabled === 'static' || enabled === 'generated') return 'enabled';
+  if (enabled === 'indirect') return 'indirect';
+  return 'disabled';
+}
+
+async function loadUnits() {
+  try {
+    const resp = await fetch(API + '/api/services');
+    allUnits = await resp.json();
+    // Sort: active first, then failed, then inactive; within groups by name
+    const order = { active: 0, running: 0, failed: 1, inactive: 2, dead: 2 };
+    allUnits.sort((a, b) => {
+      const oa = order[a.active] ?? 9;
+      const ob = order[b.active] ?? 9;
+      if (oa !== ob) return oa - ob;
+      return a.name.localeCompare(b.name);
+    });
+    renderUnits();
+  } catch (e) {
+    document.getElementById('unit-grid').innerHTML =
+      '<span style="color:var(--red)">Failed to load units: ' + e.message + '</span>';
+  }
+}
+
+function renderUnits() {
+  const search = document.getElementById('search').value.toLowerCase();
+  const filter = document.getElementById('filter-state').value;
+  const grid = document.getElementById('unit-grid');
+
+  let filtered = allUnits;
+  if (filter === 'active') filtered = filtered.filter(u => u.active === 'active' || u.active === 'running');
+  else if (filter === 'inactive') filtered = filtered.filter(u => u.active === 'inactive' || u.active === 'dead');
+  else if (filter === 'failed') filtered = filtered.filter(u => u.active === 'failed' || u.sub === 'failed');
+  else if (filter === 'enabled') filtered = filtered.filter(u => u.enabled === 'enabled' || u.enabled === 'static');
+  else if (filter === 'disabled') filtered = filtered.filter(u => u.enabled === 'disabled');
+
+  if (search) filtered = filtered.filter(u => u.name.toLowerCase().includes(search));
+
+  if (filtered.length === 0) {
+    grid.innerHTML = '<span style="color:var(--dim)">No units match the current filter.</span>';
+    return;
+  }
+
+  let html = '';
+  for (const u of filtered) {
+    const cls = statusClass(u.active, u.sub);
+    const en = enabledLabel(u.enabled);
+    html += '<div class="unit-card">';
+    html += '<span class="status-badge ' + cls + '">' + statusLabel(u.active, u.sub) + '</span>';
+    html += '<div class="unit-name">' + escHTML(u.name) + '</div>';
+    html += '<div class="unit-detail">';
+    html += '<span class="unit-detail-item">load: ' + escHTML(u.loaded) + '</span>';
+    html += '<span class="unit-detail-item">sub: ' + escHTML(u.sub) + '</span>';
+    html += '<span class="unit-detail-item">' + en + '</span>';
+    html += '</div>';
+    html += '<div class="unit-actions">';
+    html += '<button class="start" onclick="doAction(\'' + escAttr(u.name) + '\',\'start\')">Start</button>';
+    html += '<button class="stop" onclick="doAction(\'' + escAttr(u.name) + '\',\'stop\')">Stop</button>';
+    html += '<button class="restart" onclick="doAction(\'' + escAttr(u.name) + '\',\'restart\')">Restart</button>';
+    html += '<button onclick="doAction(\'' + escAttr(u.name) + '\',\'enable\')">Enable</button>';
+    html += '<button onclick="doAction(\'' + escAttr(u.name) + '\',\'disable\')">Disable</button>';
+    html += '<button class="danger" onclick="openEdit(\'' + escAttr(u.name) + '\')">Edit</button>';
+    html += '</div></div>';
+  }
+  grid.innerHTML = html;
+}
+
+async function doAction(name, action) {
+  const cmd = action === 'enable' || action === 'disable'
+    ? 'sudo systemctl ' + action + ' ' + name
+    : 'systemctl ' + action + ' ' + name;
+  logCmd(cmd, '...');
+  try {
+    const resp = await fetch(API + '/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, action: action })
+    });
+    const data = await resp.json();
+    updateLastLog(data.output, data.exit_code);
+    loadUnits();
+  } catch (e) {
+    updateLastLog('Error: ' + e.message, 1);
+  }
+}
+
+async function openEdit(name) {
+  editingUnit = name;
+  document.getElementById('modal-title').textContent = 'Edit: ' + name;
+  document.getElementById('modal-path').textContent = '/etc/systemd/system/' + name;
+  document.getElementById('modal-content').value = 'Loading...';
+  document.getElementById('edit-modal').classList.add('show');
+
+  try {
+    const resp = await fetch(API + '/api/cat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name })
+    });
+    const data = await resp.json();
+    document.getElementById('modal-content').value = data.content || '(empty or error reading file)';
+  } catch (e) {
+    document.getElementById('modal-content').value = 'Error: ' + e.message;
+  }
+}
+
+function closeModal() {
+  document.getElementById('edit-modal').classList.remove('show');
+  editingUnit = null;
+}
+
+async function saveUnit() {
+  if (!editingUnit) return;
+  const content = document.getElementById('modal-content').value;
+  const name = editingUnit;
+  const cmd = 'write /etc/systemd/system/' + name + ' && systemctl daemon-reload';
+  logCmd(cmd, '...');
+  try {
+    const resp = await fetch(API + '/api/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, content: content })
+    });
+    const data = await resp.json();
+    updateLastLog(data.output, data.exit_code);
+    closeModal();
+    loadUnits();
+  } catch (e) {
+    updateLastLog('Error: ' + e.message, 1);
+  }
+}
+
+// --- Command Log ---
+let lastCmdEntry = null;
+
+function logCmd(command, output) {
+  const log = document.getElementById('cmd-log');
+  const ts = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.className = 'cmd-entry';
+  div.innerHTML = '<span class="cmd-ts">' + ts + '</span> '
+    + '<span class="cmd-cmd">$ ' + escHTML(command) + '</span>'
+    + '<div class="cmd-out">' + escHTML(output) + '</div>';
+  log.prepend(div);
+  lastCmdEntry = div;
+}
+
+function updateLastLog(output, exitCode) {
+  if (!lastCmdEntry) return;
+  const outEl = lastCmdEntry.querySelector('.cmd-out');
+  const cls = exitCode === 0 ? 'cmd-out' : 'cmd-err';
+  outEl.className = cls;
+  outEl.textContent = output;
+  const exitSpan = document.createElement('span');
+  exitSpan.className = 'cmd-exit';
+  exitSpan.textContent = ' [exit ' + exitCode + ']';
+  lastCmdEntry.appendChild(exitSpan);
+}
+
+function clearLog() {
+  document.getElementById('cmd-log').innerHTML = '';
+}
+
+function toggleAutoRefresh() {
+  const checked = document.getElementById('auto-refresh').checked;
+  if (checked) {
+    autoRefreshTimer = setInterval(loadUnits, 10000);
+  } else {
+    clearInterval(autoRefreshTimer);
+  }
+}
+
+function escHTML(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function escAttr(s) {
+  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
+}
+
+// Init
+document.addEventListener('DOMContentLoaded', () => {
+  loadUnits();
+  autoRefreshTimer = setInterval(loadUnits, 10000);
+});
+</script>
+
+</body>
+</html>

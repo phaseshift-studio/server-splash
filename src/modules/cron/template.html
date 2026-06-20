@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cron Dashboard — <!-- HOSTNAME --></title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<h1>&#x23F0;&#xFE0F; Cron Dashboard</h1>
+<p class="subtitle"><!-- HOSTNAME --> &mdash; cron job management &mdash; <strong>:<!-- PORT --></strong></p>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('user')">User Crons</button>
+  <button class="tab" onclick="switchTab('system')">System Crons</button>
+</div>
+
+<div class="controls-bar">
+  <button id="refresh-btn" onclick="loadCrons()">Refresh</button>
+  <button id="new-job-btn" onclick="openNewJob()">+ New Job</button>
+</div>
+
+<!-- Job editor panel -->
+<div class="editor-panel" id="editor-panel">
+  <h3 id="editor-title">New Cron Job</h3>
+  <div id="editor-visual">
+    <div class="editor-row">
+      <label style="color:var(--green)">Minute</label>
+      <select id="vis-minute">
+        <option value="*">* (every)</option>
+      </select>
+      <label style="color:var(--blue)">Hour</label>
+      <select id="vis-hour">
+        <option value="*">* (every)</option>
+      </select>
+    </div>
+    <div class="editor-row">
+      <label style="color:var(--magenta)">Day of Month</label>
+      <select id="vis-dom">
+        <option value="*">* (every)</option>
+      </select>
+      <label style="color:var(--orange)">Month</label>
+      <select id="vis-month">
+        <option value="*">* (every)</option>
+      </select>
+    </div>
+    <div class="editor-row">
+      <label style="color:var(--cyan)">Day of Week</label>
+      <select id="vis-dow">
+        <option value="*">* (every)</option>
+      </select>
+      <button class="raw-toggle" onclick="toggleRaw()">Edit raw syntax</button>
+    </div>
+  </div>
+  <div id="editor-raw" style="display:none">
+    <input type="text" class="raw-cron" id="raw-cron" placeholder="* * * * * command" oninput="syncRawToVisual()">
+  </div>
+  <div class="editor-row">
+    <label>Command</label>
+    <input type="text" id="job-command" placeholder="/path/to/script.sh">
+  </div>
+  <div class="editor-actions">
+    <button class="cancel-btn" onclick="closeEditor()">Cancel</button>
+    <button class="save-btn" onclick="saveJob()">Save</button>
+  </div>
+</div>
+
+<div class="job-list" id="job-list">Loading...</div>
+
+<h2>Command Log</h2>
+<div class="cmd-log-header">
+  <span style="color:var(--dim);font-size:.8rem">Crontab operations log</span>
+  <button id="clear-log" onclick="clearLog()">Clear</button>
+</div>
+<div id="cmd-log"></div>
+
+<footer><!-- HOSTNAME --> &mdash; Cron Dashboard</footer>
+
+<script>
+const API = 'http://<!-- HOSTNAME -->:<!-- PORT -->';
+let activeTab = 'user';
+let crons = { user: [], system: [] };
+let editingIndex = -1;
+let editingTab = 'user';
+let isRawMode = false;
+
+// --- Populate visual selects ---
+function initSelects() {
+  const minuteOpts = ['*'];
+  for (let i = 0; i < 60; i += 5) minuteOpts.push(String(i));
+  for (let i = 1; i < 60; i++) if (i % 5 !== 0) minuteOpts.push(String(i));
+  populateSelect('vis-minute', minuteOpts);
+
+  const hourOpts = ['*'];
+  for (let i = 0; i < 24; i++) hourOpts.push(String(i));
+  populateSelect('vis-hour', hourOpts);
+
+  const domOpts = ['*'];
+  for (let i = 1; i <= 31; i++) domOpts.push(String(i));
+  populateSelect('vis-dom', domOpts);
+
+  const monthOpts = ['*'];
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  for (let i = 0; i < 12; i++) monthOpts.push(String(i + 1));
+  populateSelect('vis-month', monthOpts);
+
+  const dowOpts = ['*'];
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  for (let i = 0; i < 7; i++) dowOpts.push(String(i));
+  populateSelect('vis-dow', dowOpts);
+}
+
+function populateSelect(id, opts) {
+  const sel = document.getElementById(id);
+  opts.forEach(o => {
+    const el = document.createElement('option');
+    el.value = o;
+    el.textContent = o;
+    sel.appendChild(el);
+  });
+}
+
+// --- Data loading ---
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => {
+    if (t.textContent.toLowerCase().includes(tab)) t.classList.add('active');
+  });
+  renderJobs();
+}
+
+async function loadCrons() {
+  try {
+    const [userResp, sysResp] = await Promise.all([
+      fetch(API + '/api/user'),
+      fetch(API + '/api/system')
+    ]);
+    crons.user = await userResp.json();
+    crons.system = await sysResp.json();
+    renderJobs();
+  } catch (e) {
+    document.getElementById('job-list').innerHTML =
+      '<span style="color:var(--red)">Failed to load: ' + e.message + '</span>';
+  }
+}
+
+function renderJobs() {
+  const jobs = crons[activeTab] || [];
+  const list = document.getElementById('job-list');
+  if (jobs.length === 0) {
+    list.innerHTML = '<span style="color:var(--dim)">No cron jobs found on this tab.</span>';
+    return;
+  }
+  let html = '';
+  jobs.forEach((job, i) => {
+    const suspended = !job.enabled;
+    html += '<div class="job-card' + (suspended ? ' suspended' : '') + '">';
+    html += '<div class="job-schedule">';
+    html += '<span class="schedule-field min">' + escHTML(job.minute) + '</span>';
+    html += '<span class="schedule-field hour">' + escHTML(job.hour) + '</span>';
+    html += '<span class="schedule-field dom">' + escHTML(job.day_of_month) + '</span>';
+    html += '<span class="schedule-field mon">' + escHTML(job.month) + '</span>';
+    html += '<span class="schedule-field dow">' + escHTML(job.day_of_week) + '</span>';
+    html += '<span class="job-status ' + (suspended ? 'suspended' : 'active') + '">'
+      + (suspended ? 'SUSPENDED' : 'ACTIVE') + '</span>';
+    html += '</div>';
+    html += '<div class="job-command">' + escHTML(job.command) + '</div>';
+    html += '<div class="job-actions">';
+    if (suspended) {
+      html += '<button class="resume" onclick="resumeJob(' + i + ')">Resume</button>';
+    } else {
+      html += '<button class="suspend" onclick="suspendJob(' + i + ')">Suspend</button>';
+    }
+    html += '<button class="edit-btn" onclick="openEditJob(' + i + ')">Edit</button>';
+    html += '<button class="delete-btn" onclick="deleteJob(' + i + ')">Delete</button>';
+    html += '</div></div>';
+  });
+  list.innerHTML = html;
+}
+
+// --- Job actions ---
+function suspendJob(index) {
+  const jobs = crons[activeTab];
+  if (!jobs[index]) return;
+  jobs[index].enabled = false;
+  saveCrons('crontab: suspend job ' + (index + 1));
+}
+
+function resumeJob(index) {
+  const jobs = crons[activeTab];
+  if (!jobs[index]) return;
+  jobs[index].enabled = true;
+  saveCrons('crontab: resume job ' + (index + 1));
+}
+
+function deleteJob(index) {
+  const jobs = crons[activeTab];
+  if (!jobs[index]) return;
+  if (!confirm('Delete cron job: ' + jobs[index].command + '?')) return;
+  jobs.splice(index, 1);
+  saveCrons('crontab: delete job');
+}
+
+async function saveCrons(desc) {
+  const jobs = crons[activeTab];
+  const lines = jobs.map(formatCronLine).join('\n') + '\n';
+
+  const endpoint = activeTab === 'user' ? '/api/user/write' : '/api/system/write';
+  logCmd(desc, '...');
+  try {
+    const resp = await fetch(API + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: lines })
+    });
+    const data = await resp.json();
+    updateLastLog(data.output, data.exit_code);
+    loadCrons();
+  } catch (e) {
+    updateLastLog('Error: ' + e.message, 1);
+  }
+}
+
+function formatCronLine(job) {
+  const prefix = job.enabled ? '' : '# ';
+  return prefix + [job.minute, job.hour, job.day_of_month, job.month, job.day_of_week, job.command].join(' ');
+}
+
+// --- Editor ---
+function openNewJob() {
+  editingIndex = -1;
+  editingTab = activeTab;
+  document.getElementById('editor-title').textContent = 'New Cron Job (' + activeTab + ')';
+  setVisualFields('*', '*', '*', '*', '*');
+  document.getElementById('job-command').value = '';
+  document.getElementById('editor-panel').classList.add('show');
+}
+
+function openEditJob(index) {
+  editingIndex = index;
+  editingTab = activeTab;
+  const job = crons[activeTab][index];
+  if (!job) return;
+  document.getElementById('editor-title').textContent = 'Edit Cron Job';
+  setVisualFields(job.minute, job.hour, job.day_of_month, job.month, job.day_of_week);
+  document.getElementById('job-command').value = job.command;
+  document.getElementById('editor-panel').classList.add('show');
+}
+
+function setVisualFields(min, hour, dom, month, dow) {
+  setSelectVal('vis-minute', min);
+  setSelectVal('vis-hour', hour);
+  setSelectVal('vis-dom', dom);
+  setSelectVal('vis-month', month);
+  setSelectVal('vis-dow', dow);
+  updateRawField();
+}
+
+function setSelectVal(id, val) {
+  const sel = document.getElementById(id);
+  for (let i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === val) { sel.selectedIndex = i; return; }
+  }
+  // Value not in list, add it
+  const opt = document.createElement('option');
+  opt.value = val;
+  opt.textContent = val;
+  sel.appendChild(opt);
+  sel.value = val;
+}
+
+function getSelectVal(id) {
+  return document.getElementById(id).value;
+}
+
+function toggleRaw() {
+  isRawMode = !isRawMode;
+  document.getElementById('editor-visual').style.display = isRawMode ? 'none' : 'block';
+  document.getElementById('editor-raw').style.display = isRawMode ? 'block' : 'none';
+  if (isRawMode) {
+    updateRawField();
+  } else {
+    syncRawToVisual();
+  }
+}
+
+function updateRawField() {
+  const raw = [getSelectVal('vis-minute'), getSelectVal('vis-hour'), getSelectVal('vis-dom'),
+    getSelectVal('vis-month'), getSelectVal('vis-dow')].join(' ');
+  document.getElementById('raw-cron').value = raw;
+}
+
+function syncRawToVisual() {
+  const parts = document.getElementById('raw-cron').value.trim().split(/\s+/);
+  if (parts.length >= 5) {
+    setVisualFields(parts[0], parts[1], parts[2], parts[3], parts[4]);
+    if (parts.length >= 6) {
+      document.getElementById('job-command').value = parts.slice(5).join(' ');
+    }
+  }
+}
+
+function getCronFields() {
+  if (isRawMode) {
+    const parts = document.getElementById('raw-cron').value.trim().split(/\s+/);
+    return {
+      minute: parts[0] || '*',
+      hour: parts[1] || '*',
+      day_of_month: parts[2] || '*',
+      month: parts[3] || '*',
+      day_of_week: parts[4] || '*',
+    };
+  }
+  return {
+    minute: getSelectVal('vis-minute'),
+    hour: getSelectVal('vis-hour'),
+    day_of_month: getSelectVal('vis-dom'),
+    month: getSelectVal('vis-month'),
+    day_of_week: getSelectVal('vis-dow'),
+  };
+}
+
+function closeEditor() {
+  document.getElementById('editor-panel').classList.remove('show');
+  editingIndex = -1;
+  isRawMode = false;
+  document.getElementById('editor-visual').style.display = 'block';
+  document.getElementById('editor-raw').style.display = 'none';
+}
+
+function saveJob() {
+  const fields = getCronFields();
+  const command = document.getElementById('job-command').value.trim();
+  if (!command) { alert('Command is required.'); return; }
+
+  const newJob = {
+    minute: fields.minute,
+    hour: fields.hour,
+    day_of_month: fields.day_of_month,
+    month: fields.month,
+    day_of_week: fields.day_of_week,
+    command: command,
+    enabled: true
+  };
+
+  const jobs = crons[editingTab];
+  if (editingIndex >= 0) {
+    newJob.enabled = jobs[editingIndex].enabled;
+    jobs[editingIndex] = newJob;
+  } else {
+    jobs.push(newJob);
+  }
+
+  // Temporarily switch activeTab so saveCrons writes the right tab
+  const prevTab = activeTab;
+  activeTab = editingTab;
+  saveCrons('crontab: ' + (editingIndex >= 0 ? 'edit' : 'add') + ' job');
+  activeTab = prevTab;
+  closeEditor();
+}
+
+// --- Command log ---
+let lastCmdEntry = null;
+
+function logCmd(command, output) {
+  const log = document.getElementById('cmd-log');
+  const ts = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.className = 'cmd-entry';
+  div.innerHTML = '<span class="cmd-ts">' + ts + '</span> '
+    + '<span class="cmd-cmd">$ ' + escHTML(command) + '</span>'
+    + '<div class="cmd-out">' + escHTML(output) + '</div>';
+  log.prepend(div);
+  lastCmdEntry = div;
+}
+
+function updateLastLog(output, exitCode) {
+  if (!lastCmdEntry) return;
+  const outEl = lastCmdEntry.querySelector('.cmd-out');
+  outEl.className = exitCode === 0 ? 'cmd-out' : 'cmd-err';
+  outEl.textContent = output;
+  const exitSpan = document.createElement('span');
+  exitSpan.className = 'cmd-exit';
+  exitSpan.textContent = ' [exit ' + exitCode + ']';
+  lastCmdEntry.appendChild(exitSpan);
+}
+
+function clearLog() { document.getElementById('cmd-log').innerHTML = ''; }
+
+function escHTML(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  initSelects();
+  loadCrons();
+});
+</script>
+
+</body>
+</html>

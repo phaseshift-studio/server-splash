@@ -1,0 +1,8 @@
+{
+  "name": "cron",
+  "description": "Cron job management panel",
+  "default_port": 9871,
+  "default_service_port": 9871,
+  "icon": "⏱️",
+  "url_prefix": "cron"
+}

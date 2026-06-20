@@ -655,6 +655,17 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
         if picked.is_empty() {
             for m in &available_modules {
                 selected_module_names.push(m.name.clone());
+                selected.push(SplashService {
+                    name: m.name.clone(),
+                    desc: m.description.clone(),
+                    icon: m.icon.clone(),
+                    protocol: "http".to_string(),
+                    port: Some(m.default_port.to_string()),
+                    host_override: None,
+                    base_path: Some(format!("/{}", m.url_prefix.trim_start_matches('/'))),
+                    group: "Dashboard Modules".to_string(),
+                    web_probe_url: None,
+                });
             }
         } else {
             let mut indices: Vec<usize> = Vec::new();
@@ -677,6 +688,17 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
             for &idx in &indices {
                 if let Some(m) = available_modules.get(idx) {
                     selected_module_names.push(m.name.clone());
+                    selected.push(SplashService {
+                        name: m.name.clone(),
+                        desc: m.description.clone(),
+                        icon: m.icon.clone(),
+                        protocol: "http".to_string(),
+                        port: Some(m.default_port.to_string()),
+                        host_override: None,
+                        base_path: Some(format!("/{}", m.url_prefix.trim_start_matches('/'))),
+                        group: "Dashboard Modules".to_string(),
+                        web_probe_url: None,
+                    });
                 }
             }
         }
@@ -698,9 +720,11 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
     );
 
     // Filter deselected services from the final list
-    let keep_names: std::collections::HashSet<&str> = probe_results.iter()
-        .map(|r| r.name.as_str()).collect();
-    selected.retain(|s| keep_names.contains(s.name.as_str()));
+    let deselected_names: std::collections::HashSet<&str> = probe_results.iter()
+        .filter(|r| !r.selected)
+        .map(|r| r.name.as_str())
+        .collect();
+    selected.retain(|s| !deselected_names.contains(s.name.as_str()));
 
     // 7. Persist config if hostname/agent is set
     let cfg_persist = crate::config::SplashConfig {
@@ -1176,7 +1200,7 @@ fn probe_and_display_services(
             std::io::stdout().flush().ok();
             probe_http(u)
         } else {
-            false
+            svc.port.is_some()
         };
 
         results.push(ProbeResult {

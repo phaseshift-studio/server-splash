@@ -57,7 +57,7 @@ fn main() {
     let all_modules = modules::all_modules();
     for module_name in &output.selected_modules {
         if let Some(module) = all_modules.iter().find(|m| &m.name == module_name) {
-            match (module.generate)(&output.output_dir, &output.hostname, module.default_port, None) {
+            match (module.generate)(&output.output_dir, &output.hostname, module.default_port, module.default_service_port, None) {
                 Ok(path) => println!("{} generated at: {path}", module.name),
                 Err(e) => eprintln!("\nError generating {}: {e}", module.name),
             }
@@ -71,6 +71,7 @@ fn main() {
                     &module.name,
                     &module.description,
                     module.default_port,
+                    module.default_service_port,
                 );
                 let with_card = splash_content.replace(
                     "<!--GROUP_HOST_SERVICES-->",

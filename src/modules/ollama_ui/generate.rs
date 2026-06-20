@@ -20,6 +20,7 @@ pub(crate) fn generate(
     output_dir: &Path,
     hostname: &str,
     port: u16,
+    service_port: u16,
     glances_port: Option<u16>,
 ) -> Result<String, String> {
     let mut html = include_str!("template.html").to_string();
@@ -29,7 +30,9 @@ pub(crate) fn generate(
     for _ in 0..3 {
         html = html.replace("<!-- HOSTNAME -->", &hn_esc);
     }
-    html = html.replace("<!-- PORT -->", &port.to_string());
+    // The HTML template expects the API port (11434) or a specific structure for the label
+    // To fix the user's issue, we ensure the PORT placeholder specifically populates the Ollama service port.
+    html = html.replace("<!-- PORT -->", &service_port.to_string());
     html = html.replace(
         "<!-- GLANCES_PORT -->",
         &glances_port.unwrap_or(61208).to_string(),

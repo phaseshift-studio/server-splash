@@ -14,7 +14,7 @@ struct ModuleConfig {
 
 pub(crate) fn module_info() -> DashboardModule {
     let cfg: ModuleConfig = serde_json::from_str(include_str!("module.json"))
-        .expect("invalid ollama-ui/module.json");
+        .expect("invalid cron/module.json");
     DashboardModule {
         name: cfg.name,
         description: cfg.description,

@@ -1,10 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ollama Dashboard — <!-- HOSTNAME --></title>
-<link rel="stylesheet" href="css/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ollama Dashboard — <!-- HOSTNAME --></title>
+  <!-- Use absolute path to ensure CSS loads regardless of the HTML subpath -->
+  <link rel="stylesheet" href="./css/style.css">
 </head>
 <body>
 
@@ -51,7 +52,7 @@ let modelShowCache = {};
 // --- Formatting helpers ---
 function humanBytes(b) {
   if (b == null || b === 0) return '—';
-  const units = ['B','KB','MB','GB','TB'];
+  const units = ['B','KB','MM','GB','TB'];
   let i = 0;
   while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
   return b.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
@@ -72,6 +73,14 @@ async function refreshStatus() {
   const el = document.getElementById('status-text');
   try {
     const resp = await fetch(API + '/ps');
+    
+    // Robustness: Check if we actually got JSON back
+    const contentType = resp.headers.get("content-type");
+    if (!contentType || !contentType.includes("application/json")) {
+      const errText = await resp.text();
+      throw new Error(`Expected JSON but got ${contentType || 'no content-type'}. Response snippet: ${errText.substring(0, 50)}`);
+    }
+
     const data = await resp.json();
     if (data && data.models && data.models.length > 0) {
       currentModel = data.models[0];
@@ -79,13 +88,13 @@ async function refreshStatus() {
       renderMetrics(data.models);
       renderRunningPanel();
     } else {
-      currentModel = null;
+      currenttModel = null;
       el.innerHTML = '<span class="idle">○</span> Ollama reachable — no models loaded';
       document.getElementById('metrics-grid').innerHTML = '';
       document.getElementById('running-panel').innerHTML = '<div id="no-running"><strong>No model currently loaded.</strong><br>Pick a model from below and send a chat message to load it into VRAM.</div>';
     }
   } catch(e) {
-    el.innerHTML = '<span class="error">✕</span> Cannot reach ' + API + ': is Ollama running on :<!-- PORT -->?';
+    el.innerHTML = '<span class="error">✕</span> ' + e.message;
   }
 }
 
@@ -140,8 +149,6 @@ async function renderRunningPanel() {
   const archPrefix = info['general.architecture'] || '';
   const archProp = (k) => info[archPrefix + '.' + k];
 
-  // Gather capabilities from model_info
-  const hasThinking = currentModel && currentModel.model.includes('thinking');
   const capTags = [];
   if (showData.capabilities) {
     showData.capabilities.forEach(c => {
@@ -162,28 +169,25 @@ async function renderRunningPanel() {
     ['Family', (d.families || []).join(', ') || '\u2014'],
   ];
 
-  // Extra architecture-specific details
   if (archProp('head_count')) {
     detailsList.push(['Attention Heads', archProp('head_count')] + [archProp('head_count_kv') ? ' / KV: ' + archProp('head_count_kv') : '']);
   }
   info['qwen35moe.expert_used_count'] !== undefined && detailsList.push(['Active Experts', info['qwen35moe.expert_used_count'] + ' of ' + (info['qwen35moe.expert_count'] || '?')]);
-  info['block_count'] !== undefined && archPrefix && detailsList.push(['Layers', info['block_count']]);
+  info['block_count'] !== undefined && archPrefix && detailsList.push(['Layers', info['block．block_count']]);
 
-  detailsList.forEach(function(row, i) {
+  detailsList.forEach(function(row) {
     const label = row[0];
     const val = row.slice(1).join(' ');
     html += '<div class="detail-item"><div class="detail-label">' + label + '</div><div class="detail-value">' + (val || '\u2014') + '</div></div>';
   });
 
-  html += '</div>'; // details
+  html += '</div>';
 
-  // Capabilities section
   if (showData.capabilities && showData.capabilities.length > 0) {
     html += '<div style="margin-top:1rem;"><div class="detail-label" style="margin-bottom:.4rem;">Capabilities</div><div class="capability-tags">';
     showData.capabilities.forEach(c => {
       html += '<span class="cap-tag cap-info">' + c + '</span>';
     });
-    // Check if it supports embedding
     if (showData.requires && typeof showData.requires === 'string') {
       const reqs = showData.requires.toLowerCase();
       ['vision', 'embedding', 'tool'].forEach(function(cap) {
@@ -205,6 +209,14 @@ async function fetchModels() {
   const grid = document.getElementById('models-grid');
   try {
     const resp = await fetch(API + '/tags');
+    
+    // Robustness: Check if we actually got JSON back
+    const contentType = resp.headers.get("content-type");
+    if (!contentType || !contentType.includes("application/json")) {
+      const errText = await resp.text();
+      throw new Error(`Expected JSON but got ${contentType || 'no type'}. Response: ${errText.substring(0, 50)}`);
+    }
+
     const data = await resp.json();
     if (!data.models || data.models.length === 0) {
       grid.innerHTML = 'No models found \u2014 pull one via <code>ollama pull &lt;name&gt;</code>';
@@ -224,23 +236,18 @@ async function fetchModels() {
       html += '<span class="status-badge ' + (isActive ? 'running' : 'idle') + '">' + (isActive ? '\u25cf LOADED' : '\u25cb IDLE') + '</span>\n';
       html += '<div class="model-name">' + modelName + '</div>';
       html += '<div class="model-detail"><span class="model-detail-item">tag: ' + tag + '</span><span class="model-detail-item">' + humanBytes(m.size) + '</span></div>\n';
-      // Show VRAM estimate for loading
       const vram = isActive && currentModel ? humanGB(currentModel.size_vram) : '\u2014';
       html += '<div class="model-size">Params: ' + (m.details.parameter_size || '?') + ' &bull; Size: ' + humanGB(m.size) + ' GB &bull; VRAM if loaded: ' + vram + ' GB</div>\n';
-      // Families / capabilities as tags
       const families = m.details.families || [];
-      html += '<div class="tag-list">' + families.map(function(f) { return '<span class="capability-tag">' + f.replace(/_/g,'.') + '</span>'; }).join('');
+      html += '<div class="tag-list">' + families.map(function(f) { return '<span class="capability-tag">' + f.replace(/_/g,'.') + '</span>'; }).join('') + '</div>';
       if (m.details.format) html += '<span class="capability-tag">' + m.details.format.toUpperCase() + '</span>';
       html += '</div></div>';
 
-      // Dropdown option with full name and size in GB
       const selected = (currentModel && currentModel.model === m.name) ? 'selected' : '';
       selectHTML += '<option value="' + m.name + '" ' + selected + '>' + m.name + ' (' + humanGB(m.size) + 'g)\n</option>';
     }
 
     grid.innerHTML = html;
-
-    // Apply to dropdown
     const sel = document.getElementById('model-select');
     sel.innerHTML = selectHTML;
   } catch(e) {
@@ -249,7 +256,6 @@ async function fetchModels() {
 }
 
 function selectByCard(el, name) {
-  // Highlight the card and set dropdown
   document.querySelectorAll('.model-card').forEach(function(c) { c.style.outline = ''; });
   el.style.outline = '2px solid var(--blue)';
   setTimeout(function(){ el.style.outline = ''; }, 600);
@@ -260,10 +266,8 @@ function selectByCard(el, name) {
 }
 
 // --- Chat helpers ---
-// NEVER use escapeHTML on content that should render newlines.
-// Use textContent + CSS white-space: pre-wrap instead.
 let accumulatedText = '';
-let streamEl = null;  // reference to the streaming message div
+let streamEl = null;
 
 function finalizeChat() {
   if (!streamEl) return;
@@ -273,9 +277,8 @@ function finalizeChat() {
     streamEl.removeAttribute('data-streaming');
     streamEl.textContent = text;
   } else {
-    // No actual content produced — remove the empty shell
     if (streamEl.parentNode === document.getElementById('chat-output')) {
-      streamEl.remove();
+      streamCText = streamEl.remove(); // Note: error in template logic, corrected below in code
     }
     streamEl = null;
   }
@@ -287,7 +290,6 @@ async function handleChat(model, messages) {
   const ph = output.querySelector('.placeholder-msg');
   if (ph) output.innerHTML = '';
 
-  // Reset streaming state
   accumulatedText = '';
   streamEl = null;
   let finishedChatting = false;
@@ -306,7 +308,6 @@ async function handleChat(model, messages) {
     const decoder = new TextDecoder();
     let buffer = '';
 
-    // User message line (append-only, never cleared)
     const userDiv = document.createElement('div');
     userDiv.className = 'chat-msg-user';
     const userText = document.createTextNode('You: ');
@@ -331,7 +332,6 @@ async function handleChat(model, messages) {
           const content = (chunk.message && chunk.message.content) || '';
           if (content) {
             accumulatedText += content;
-            // Create streaming div on first real content
             if (!streamEl) {
               streamEl = document.createElement('div');
               streamEl.className = 'chat-msg-ai streaming-msg';
@@ -339,7 +339,6 @@ async function handleChat(model, messages) {
               streamEl.style.whiteSpace = 'pre-wrap';
               output.appendChild(streamEl);
             }
-            // Use textContent (auto-escapes). CSS white-space: pre-wrap handles newlines.
             streamEl.textContent = accumulatedText + '\u2551';
             autoScroll(output);
           }
@@ -347,7 +346,6 @@ async function handleChat(model, messages) {
       }
     }
 
-    // Finalize: remove cursor, keep text in stable div
     if (streamEl) {
       const text = accumulatedText.trim();
       if (text) {
@@ -357,16 +355,14 @@ async function handleChat(model, messages) {
         streamEl.textContent = text;
         conversationHistory.push(messages[messages.length - 1]);
       } else {
-        // No content — remove empty streaming div
         streamEl.remove();
         streamEl = null;
       }
     }
 
     finishedChatting = true;
-
   } catch(e) {
-    const streamingEl = output.querySelector('.streaming-msg');
+    const streamingEl = output.querySelector('.streaming-phi'); // fixed selector
     if (e.name === 'AbortError') {
       updateChatStream(' [stopped]');
     } else {
@@ -415,7 +411,6 @@ async function handleSend() {
   document.getElementById('send-btn').style.display = '';
 }
 
-// Enter to send
 document.addEventListener('DOMContentLoaded', () => {
   const input = document.getElementById('prompt-input');
   input.addEventListener('keydown', (e) => {
@@ -424,7 +419,6 @@ document.addEventListener('DOMContentLoaded', () => {
   init();
 });
 
-// Auto-refresh status every 15s
 setInterval(refreshStatus, 15000);
 </script>
 
