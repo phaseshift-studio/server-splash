@@ -1,0 +1,16 @@
+[Unit]
+Description=server-splash — regenerate the services dashboard
+Documentation=https://github.com/phaseshift-studio/server-splash
+# The dashboard lists container ports, so docker must be up first.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust both paths for your install.
+WorkingDirectory=/opt/server-splash
+ExecStart=/usr/local/bin/splash --auto --deploy /var/www/html
+# A failed run must not leave a half-written page behind; splash writes the file
+# in one call, so there is nothing to clean up here.
+TimeoutStartSec=120
+Nice=10

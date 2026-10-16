@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh the server-splash dashboard periodically
+Documentation=https://github.com/phaseshift-studio/server-splash
+
+[Timer]
+# A short delay after boot, then refresh on a fixed cadence. Adding a service on the
+# host now shows up on the page within one interval — no HTML editing involved.
+OnBootSec=2min
+OnUnitActiveSec=15min
+# Run once on the next boot if a refresh was missed while the machine was off.
+Persistent=true
+Unit=splash.service
+
+[Install]
+WantedBy=timers.target

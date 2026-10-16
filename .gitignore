@@ -1,5 +1,24 @@
 /target
 .codegraph
-*.lock
-server-splasih
 .mcp.json
+
+# Cargo.lock IS committed on purpose: this ships as a binary, and a lockfile is what
+# makes a release build reproducible. (The old `*.lock` rule excluded it.)
+
+# Default output directory of the generator.
+/server-splash
+
+# Archived copies of what a site was serving (see scripts/backup-site.sh).
+/backups
+
+# Scratch file from the atomic page write (see generator::write_atomic).
+*.tmp-write
+
+# Compose reads this for per-machine overrides; it is not shared.
+.env
+
+# Generator scratch/state files — never deployed, never committed.
+dashboard.json
+splash-state.json
+agent-response.json
+splash-meta.json

@@ -1,0 +1,81 @@
+# server-splash — a generated dashboard for the services on this machine.
+#
+#   docker compose up -d          then open http://<this-host>:6420
+#
+# `network_mode: host` and `pid: host` are not optional. The tool discovers what is
+# running by reading this host's listening sockets, and inside a private network
+# namespace it would only ever see itself. `pid: host` is what lets `ss` name the
+# process behind each port instead of showing a bare number.
+
+services:
+  server-splash:
+    image: ghcr.io/phaseshift-studio/server-splash:latest
+    # Remove `build:` to run the published image instead of the local tree.
+    build: .
+    container_name: server-splash
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    # Shares the host's hostname, so the dashboard titles itself after the machine
+    # rather than after the container id.
+    uts: host
+
+    environment:
+      # The port this serves on. Not 8080: that is usually nginx.
+      # If it is taken, the container says which service owns it and suggests a free
+      # port rather than crash-looping on "address already in use".
+      SPLASH_PORT: "${SPLASH_PORT:-6420}"
+
+      # How the dashboard is reached in a browser. Left empty, it is derived from the
+      # machine (`uts: host` above makes that the host's name) and a bare name gets
+      # `.local` appended. Set it if your browser reaches this box by another name.
+      #
+      # Note: compose does not run shell commands, so `$(hostname)` here would be
+      # passed through literally.
+      SPLASH_HOSTNAME: "${SPLASH_HOSTNAME:-}"
+      # Seconds between rediscoveries. 0 generates once and never refreshes.
+      SPLASH_INTERVAL: "${SPLASH_INTERVAL:-900}"
+
+      # Optional: Glances powers the live GPU cards. This URL is fetched by the
+      # *browser*, so it must not be localhost.
+      # SPLASH_GLANCES: "http://ginger.local:61208"
+
+      # Optional: ports to leave off the page, e.g. the port this serves on.
+      # SPLASH_EXCLUDE_PORTS: "6420"
+
+      # Optional: an OpenAI-compatible endpoint (Ollama) to name services the
+      # built-in catalog does not recognise. Point it at the host, not the container.
+      # SPLASH_AGENT_URL: "http://host.docker.internal:11434"
+      # SPLASH_NO_AGENT: "true"
+
+    volumes:
+      # Container names and images — the best source of "what is this port?".
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # systemd unit descriptions. Without it services still appear, but named by
+      # port and container rather than by their unit.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+      # Without this the subtitle would describe the *container's* distribution
+      # (Debian) rather than the machine actually being documented.
+      - /etc/os-release:/host/etc/os-release:ro
+
+    # --- NVIDIA GPUs ---------------------------------------------------------
+    # Untick this to add GPU cards to the page from `nvidia-smi` at generation time.
+    # (The live GPU panel only needs SPLASH_GLANCES above.)
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    # --- Writing into an existing web root -----------------------------------
+    # If you would rather keep serving the page from Apache or nginx, mount the web
+    # root and deploy into it instead of using the built-in server:
+    #
+    # volumes:
+    #   - /var/www/html:/var/www/html
+    # command: ["--auto", "--deploy", "/var/www/html"]
+    #
+    # ...and set SPLASH_PORT: "0" so the built-in server stays off.

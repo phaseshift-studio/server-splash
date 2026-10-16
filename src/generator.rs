@@ -1,27 +1,135 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::fs;
 use crate::wizard::{SplashService, WizardOutput};
 
-fn group_key(svc: &SplashService) -> Cow<'static, str> {
-    let override_ = svc.host_override.as_deref().unwrap_or("");
-    if !override_.is_empty() && override_ != "localhost" {
-        return Cow::Borrowed("Remote & Guest VMs");
+/// The studio that builds this tool, linked from every generated page.
+pub(crate) const PHASESIT_URL: &str = "https://phaseshift.studio";
+
+/// Icons shipped with the binary, written into `<output>/icons/` on every run.
+///
+/// Embedded rather than read from disk so the binary is self-contained: the icon
+/// survives being copied to another machine, which is how it gets deployed.
+pub(crate) const BUNDLED_ICONS: &[(&str, &[u8])] = &[
+    ("metatron.png", include_bytes!("assets/metatron.png")),
+    ("metatron@2x.png", include_bytes!("assets/metatron@2x.png")),
+];
+
+/// Minimal base64, so icons can be embedded without pulling in a dependency.
+pub(crate) fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b1 = *chunk.first().unwrap_or(&0) as u32;
+        let b2 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b3 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b1 << 16) | (b2 << 8) | b3;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
-    match svc.group.as_str() {
-        "Monitoring" | "Development" | "Storage & Sharing" | "Infrastructure" => Cow::Owned(svc.group.clone()),
-        _ => Cow::Borrowed("Host Services"),
+    out
+}
+
+fn mime_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
     }
 }
 
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+/// Bundled asset bytes for a path like `icons/metatron.png`, preferring the 2x file
+/// when embedding (one source that is sharp on every display beats a srcset pair).
+fn bundled_bytes(path: &str, prefer_retina: bool) -> Option<(&'static str, &'static [u8])> {
+    let file = path.rsplit('/').next()?;
+    if prefer_retina {
+        if let Some(stem) = file.strip_suffix(".png") {
+            let retina = format!("{stem}@2x.png");
+            if let Some(hit) = BUNDLED_ICONS.iter().find(|(n, _)| *n == retina) {
+                return Some((hit.0, hit.1));
+            }
+        }
     }
+    BUNDLED_ICONS.iter().find(|(n, _)| *n == file).map(|(n, b)| (*n, *b))
 }
 
+/// Where an image icon should actually load from.
+///
+/// Files are the default only when embedding is turned off; embedding is preferred
+/// because a relative `icons/…` path only resolves when the page is served from the
+/// directory it was written to. That is not a hypothetical: this deployment already
+/// has a subresource the server refuses to serve (`/ollama-ui/css/style.css` → 403),
+/// and an icon that fails to load renders as a grey box.
+fn icon_src(icon: &str, icon_data: Option<&[u8]>, inline: bool) -> String {
+    if icon.starts_with("http://") || icon.starts_with("https://") {
+        return icon.to_string(); // a curated remote logo; nothing local to embed
+    }
+    if !inline {
+        return icon.to_string();
+    }
+    if let Some(bytes) = icon_data {
+        return format!("data:{};base64,{}", mime_for(icon), base64(bytes));
+    }
+    if let Some((name, bytes)) = bundled_bytes(icon, true) {
+        return format!("data:{};base64,{}", mime_for(name), base64(bytes));
+    }
+    icon.to_string() // a file the user supplied that we have no bytes for
+}
+
+/// Is this icon an image file rather than an emoji?
+///
+/// Emoji never contain a slash or an image extension, so this is unambiguous.
+pub(crate) fn is_image_icon(icon: &str) -> bool {
+    let lower = icon.trim().to_lowercase();
+    if !(lower.contains('/') || lower.starts_with("http")) {
+        return false;
+    }
+    [".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp", ".bmp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Write via a temporary file and rename.
+///
+/// `--serve` reads this file while the refresh thread rewrites it, and the rename means
+/// a reader sees either the old page or the new one, never half of either.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp-write");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+/// Write the bundled icons and any icons fetched from services.
+fn write_icons(output: &WizardOutput) -> Result<(), String> {
+    let dir = output.output_dir.join("icons");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create icons dir: {e}"))?;
+
+    for (name, bytes) in BUNDLED_ICONS {
+        std::fs::write(dir.join(name), bytes)
+            .map_err(|e| format!("Failed to write icon {name}: {e}"))?;
+    }
+
+    for svc in &output.selected_services {
+        if let Some(bytes) = &svc.icon_data {
+            // The catalog names these `icons/<port>.<ext>`.
+            if let Some(file) = svc.icon.rsplit('/').next() {
+                std::fs::write(dir.join(file), bytes)
+                    .map_err(|e| format!("Failed to write icon {file}: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Escape text for use in HTML content.
 fn esc(s: &str) -> Cow<'_, str> {
     if s.contains(['&', '<', '>', '"']) {
         Cow::Owned(
@@ -35,239 +143,401 @@ fn esc(s: &str) -> Cow<'_, str> {
     }
 }
 
-fn card_class(svc: &SplashService) -> &'static str {
-    if svc.port.is_none() || svc.protocol.is_empty() {
-        "status-down"
-    } else {
-        "status-up"
+/// Escape text for use in a double-quoted HTML attribute.
+fn esc_attr(s: &str) -> String {
+    esc(s).replace('\'', "&#39;")
+}
+
+/// Sort key for a group heading.
+///
+/// The original code keyed grouping off a `BTreeMap`, which silently reordered the
+/// page alphabetically and put "Remote & Guest VMs" above "Host Services". Order is a
+/// presentation decision, so it is made explicitly here.
+fn group_rank(name: &str) -> (u8, String) {
+    match name {
+        "Host Services" => (0, String::new()),
+        "Remote & Guest VMs" => (1, String::new()),
+        "Monitoring" => (2, String::new()),
+        "Development" => (3, String::new()),
+        other => (4, other.to_lowercase()),
     }
 }
 
-fn render_right(svc: &SplashService) -> String {
-    let port = svc.port.as_deref().unwrap_or("");
-    if !port.is_empty() {
-        let proto = capitalize(&svc.protocol).to_lowercase();
-        format!("<span class='protocol'>{proto}:</span>")
-    } else {
-        let lock_text = String::from_utf8(vec![0xe2, 0x9a, 0xa2, 0x20, 0x64, 0x61, 0x65, 0x6d, 0x6f, 0x6e, 0x20, 0x6f, 0x6e, 0x6c, 0x79]).unwrap();
-        format!("<span class='rd'>&#x1F512; {lock_text}</span>")
+fn group_icon(name: &str) -> &'static str {
+    match name {
+        "Host Services" => "&#x2699;&#xFE0F;",
+        "Remote & Guest VMs" => "&#x1F3E1;&#xFE0F;",
+        "Monitoring" => "&#x1F4C8;",
+        "Development" => "&#x1F6E0;&#xFE0F;",
+        "Storage & Sharing" => "&#x1F5C4;&#xFE0F;",
+        _ => "&#x1F539;",
     }
 }
 
-fn card_href(svc: &SplashService, hostname: &str) -> String {
+/// Protocols a browser can actually follow from the dashboard.
+fn is_linkable(protocol: &str) -> bool {
+    matches!(protocol, "http" | "https" | "ssh" | "vnc" | "mqtt" | "ftp" | "ftps")
+}
+
+/// Full URL for a service, or `None` when it should not be a link.
+///
+/// A raw `tcp` service (SMB, a database, …) must not become a link: the old code
+/// wrapped everything in `http://`, so clicking "MySQL" opened a broken page. Those
+/// render as plain cards showing their protocol and port instead.
+fn card_href(svc: &SplashService, hostname: &str) -> Option<String> {
     let port = svc.port.as_deref().unwrap_or("");
-    if port.is_empty() { return String::new(); }
+    if port.is_empty() || svc.local_only || !is_linkable(&svc.protocol.to_lowercase()) {
+        return None;
+    }
     let host = esc(svc.host_override.as_deref().unwrap_or(hostname));
-    let bp = esc(svc.base_path.as_deref().unwrap_or(""));
-    match svc.protocol.to_lowercase().as_str() {
-        "ssh" => format!("ssh://{}:{}{}", host, port, bp),
-        "vnc" => format!("vnc://{}:{}{}", host, port, bp),
-        _ => format!("http://{}:{}{}", host, port, bp),
-    }
+    let bp = esc(svc.base_path.as_deref().unwrap_or("")).into_owned();
+    Some(match svc.protocol.to_lowercase().as_str() {
+        "ssh" => format!("ssh://{host}:{port}{bp}"),
+        "vnc" => format!("vnc://{host}:{port}{bp}"),
+        "mqtt" => format!("mqtt://{host}:{port}{bp}"),
+        "https" => format!("https://{host}:{port}{bp}"),
+        _ => format!("http://{host}:{port}{bp}"),
+    })
 }
 
-fn click_handler(svc: &SplashService) -> Option<String> {
-    if svc.protocol.to_lowercase().as_str() == "ssh" {
-        Some("logsmodal('SSH Server')".to_string())
-    } else if svc.port.is_some() {
-        let href = card_href(svc, "");
-        Some(format!("openservice('{}')", esc(&href)))
-    } else {
-        None
+/// The trailing chip on a card: `http: :11434`, or a lock for unreachable things.
+fn render_chip(svc: &SplashService) -> String {
+    let port = svc.port.as_deref().unwrap_or("");
+    if port.is_empty() {
+        return "<div class=\"link-wrap\"><span class=\"locked\">&#x1F512; daemon only</span></div>".to_string();
     }
+    if svc.local_only {
+        return "<div class=\"link-wrap\"><span class=\"locked\">&#x1F512; localhost only</span></div>".to_string();
+    }
+    let proto_lower = svc.protocol.to_lowercase();
+    let proto = esc(&proto_lower);
+    format!(
+        "<div class=\"link-wrap\"><span class=\"protocol\">{proto}:</span><span class=\"link\">:{port}</span></div>"
+    )
 }
 
-fn render_card(svc: &SplashService, hostname: &str) -> String {
-    let status_cls = card_class(svc);
-    let port_str = svc.port.as_deref().unwrap_or("");
-    let icon = esc_short(&svc.icon);
-    let name = esc_short(&svc.name);
-    let desc = esc(&svc.desc).into_owned();
+fn render_card(svc: &SplashService, hostname: &str, inline_icons: bool) -> String {
+    let href = card_href(svc, hostname);
+    let probe = svc
+        .web_probe_url
+        .as_deref()
+        .filter(|u| !u.is_empty() && !u.eq_ignore_ascii_case("none"));
 
-    let href_val = if port_str.is_empty() {
-        String::new()
+    // Initial state comes from the generation-time probe so the page is useful even
+    // with JavaScript disabled; the script then refreshes it live.
+    let initial = if probe.is_none() {
+        "status-unknown"
+    } else if svc.alive {
+        "status-up"
     } else {
-        format!("href=\"{}\"", esc(&card_href(svc, hostname)))
+        "status-down"
     };
 
-    let probe_attr = if let Some(ref url) = svc.web_probe_url {
-        if !url.is_empty() && url != "none" {
-            format!(r#"data-probe="{}""#, esc(url))
-        } else { String::new() }
-    } else if svc.port.is_some() {
-        let h = esc(svc.host_override.as_deref().unwrap_or(hostname));
-        let p = svc.port.as_deref().unwrap_or("");
-        format!(r#"data-probe="http://{}:{}""#, esc(&h), esc(p))
-    } else { String::new() };
-
-    let right_html = render_right(svc);
-    let onclick = click_handler(svc).map(|handler| format!("onclick=\"{}\"", handler));
-    let card_tag = if !href_val.is_empty() { "a" } else { "div" };
-
-    let mut c = String::new();
-    c.push('<');
-    c.push_str(card_tag);
-    c.push_str(" class=\"card service-card ");
-    c.push_str(status_cls);
-    c.push('"');
-    if !href_val.is_empty() { c.push(' '); c.push_str(&href_val); }
-    if !probe_attr.is_empty() { c.push(' '); c.push_str(&probe_attr); }
-    if let Some(ref onclick) = onclick { c.push(' '); c.push_str(onclick); }
-    c.push('>');
-
-    c.push_str("<span class='status-badge'></span>");
-    c.push_str("<span class='icon'>");
-    c.push_str(&icon);
-    c.push_str("</span>");
-    c.push_str("<div class='info'><span class='name'>");
-    c.push_str(&name);
-    c.push_str("</span><br><span class='desc'>");
-    c.push_str(&desc);
-    c.push_str("</span></div>");
-
-    if !right_html.is_empty() {
-        c.push_str("<div class='link-wrap'>");
-        c.push_str(&right_html);
-        c.push_str("</div>");
+    let tag = if href.is_some() { "a" } else { "div" };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<{tag} class=\"card {initial}{local}{unlinked}\"",
+        local = if svc.local_only { " local-only" } else { "" },
+        unlinked = if href.is_none() { " no-link" } else { "" },
+    ));
+    if let Some(h) = &href {
+        out.push_str(&format!(" href=\"{}\"", esc_attr(h)));
     }
-
-    c.push(' ');
-    c.push_str("</");
-    c.push_str(card_tag);
-    c.push('>');
-    c
+    if let Some(p) = probe {
+        out.push_str(&format!(" data-probe=\"{}\"", esc_attr(p)));
+    }
+    out.push_str(&format!(" data-service=\"{}\">\n", esc_attr(&svc.name)));
+    out.push_str("  <span class=\"status-icon\" aria-hidden=\"true\">&#x25CF;</span>\n");
+    if is_image_icon(&svc.icon) {
+        let src = esc_attr(&icon_src(&svc.icon, svc.icon_data.as_deref(), inline_icons));
+        // When embedding we already chose the 2x bytes, so a srcset would be a
+        // second copy of the same picture.
+        let srcset = if inline_icons {
+            String::new()
+        } else {
+            svc.icon
+                .strip_suffix(".png")
+                .map(|stem| format!("{stem}@2x.png"))
+                .filter(|candidate| BUNDLED_ICONS.iter().any(|(n, _)| candidate.ends_with(n)))
+                .map(|retina| format!(" srcset=\"{retina} 2x\""))
+                .unwrap_or_default()
+        };
+        out.push_str(&format!(
+            "  <span class=\"icon\"><img class=\"icon-img\" src=\"{src}\"{srcset} alt=\"\"></span>\n"
+        ));
+    } else {
+        out.push_str(&format!("  <span class=\"icon\">{}</span>\n", esc_attr(&svc.icon)));
+    }
+    out.push_str(&format!(
+        "  <div class=\"info\"><span class=\"name\">{}</span><br><span class=\"desc\">{}</span></div>\n",
+        esc_attr(&svc.name),
+        esc_attr(&svc.desc)
+    ));
+    out.push_str(&format!("  {}\n", render_chip(svc)));
+    out.push_str(&format!("</{tag}>\n"));
+    out
 }
 
-fn esc_short(s: &str) -> String {
-    let truncated: String = s.chars().take(40).collect();
-    esc(&truncated).into_owned()
+/// Render every group, in rank order, with services sorted by port for stable diffs.
+fn render_groups(services: &[SplashService], hostname: &str, inline_icons: bool) -> String {
+    let mut grouped: BTreeMap<String, Vec<&SplashService>> = BTreeMap::new();
+    for svc in services {
+        if svc.hidden {
+            continue;
+        }
+        let key = if svc.group.trim().is_empty() { "Host Services".to_string() } else { svc.group.clone() };
+        grouped.entry(key).or_default().push(svc);
+    }
+
+    let mut names: Vec<String> = grouped.keys().cloned().collect();
+    names.sort_by_key(|n| group_rank(n));
+
+    let mut out = String::new();
+    for name in names {
+        let mut svcs = grouped.remove(&name).unwrap_or_default();
+        svcs.sort_by_key(|s| (s.port_num().unwrap_or(u16::MAX), s.name.to_lowercase()));
+
+        out.push_str(&format!(
+            "<h2>{} {}</h2>\n<div class=\"grid\">\n",
+            group_icon(&name),
+            esc(&name)
+        ));
+        for svc in svcs {
+            out.push_str(&render_card(svc, hostname, inline_icons));
+        }
+        out.push_str("</div>\n\n");
+    }
+    out
 }
 
-/// For known groups (Host Services, Remote & Guest VMs) the template already
-/// provides `<h2>` and `<div class="grid">`, so we just return the cards.
-/// Custom groups get their own heading + grid wrapper.
-fn format_group_section(name: &str, svcs: &[&SplashService], hostname: &str) -> String {
-    let is_known = matches!(name, "Host Services" | "Remote & Guest VMs");
+/// The chip row under the title: RAM, storage, cores, link speed.
+fn render_sys_chips(output: &WizardOutput) -> String {
+    output
+        .sys_chips
+        .iter()
+        .map(|chip| format!("  <span class=\"chip\">{}</span>\n", esc_attr(chip)))
+        .collect()
+}
 
-    let mut s = String::new();
-    if !is_known {
-        let disp: String = format!("[{}] {}", &name[0..=0].to_uppercase(), &name[1..]);
-        s.push_str(&format!("<h2>{}</h2>\n<div class=\"grid\">\n", esc(&disp).into_owned()));
+/// Hand the browser everything it needs to re-discover services on its own:
+/// which ports are already shown, which ones to try, and how to present a hit.
+///
+/// This is what makes the in-page "Resync" button possible with no backend — a static
+/// page fetching a JSON file could only ever show what the last build contained.
+fn resync_config(output: &WizardOutput, hostname: &str) -> String {
+    let known: Vec<u16> = output
+        .selected_services
+        .iter()
+        .filter(|s| !s.hidden)
+        .filter_map(|s| s.port_num())
+        .collect();
+
+    let catalog = crate::catalog::Catalog::load(&output.overrides_path);
+    let payload = serde_json::json!({
+        "host": hostname,
+        "knownPorts": known,
+        "candidates": crate::catalog::RESYNC_CANDIDATE_PORTS,
+        "catalog": catalog.port_index(),
+        "speedtest": {
+            "file": if output.speedtest_bytes > 0 { "speedtest.bin" } else { "" },
+            "bytes": output.speedtest_bytes,
+        },
+    });
+
+    // `<` is escaped so a value can never terminate the surrounding <script>.
+    serde_json::to_string(&payload)
+        .unwrap_or_else(|_| "{}".to_string())
+        .replace('<', "\\u003c")
+}
+
+/// Deterministic incompressible payload for the speed test.
+///
+/// Written only when it is missing or the wrong size, so a 15-minute timer does not
+/// push 8 MB through the filesystem every quarter of an hour.
+fn write_speedtest_payload(output: &WizardOutput) -> Result<(), String> {
+    if output.speedtest_bytes == 0 {
+        return Ok(());
     }
-    for svc in svcs {
-        s.push_str(&render_card(svc, hostname));
+    let path = output.output_dir.join("speedtest.bin");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() == output.speedtest_bytes {
+            return Ok(());
+        }
     }
-    if !is_known {
-        s.push_str("</div>\n");
+
+    let size = output.speedtest_bytes as usize;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = Vec::with_capacity(size);
+    while bytes.len() < size {
+        // xorshift64*, so the payload does not compress and cannot be served from a
+        // smaller cached copy.
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        bytes.extend_from_slice(&state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
     }
-    s
+    bytes.truncate(size);
+
+    std::fs::write(&path, bytes).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// The GPU panel: cards pre-filled from `nvidia-smi`, which the page then refreshes
+/// from the Glances API when one is configured.
+///
+/// Without this the panel only appeared once a fetch resolved — and never at all if
+/// Glances was absent or unreachable from the browser.
+fn render_gpu_section(output: &WizardOutput) -> String {
+    let live = output.glances_api_base.as_deref().unwrap_or("").trim();
+    if output.gpus.is_empty() && live.is_empty() {
+        return String::new();
+    }
+
+    let mut cards = String::new();
+    for gpu in &output.gpus {
+        let (colour, _) = if gpu.mem_pct > 80 {
+            ("#ff6e6a", "high")
+        } else if gpu.mem_pct > 40 {
+            ("#e5f07a", "medium")
+        } else {
+            ("#9ece6a", "low")
+        };
+        let temp = gpu.temp_c.map(|t| format!("{t}\u{00B0}C")).unwrap_or_else(|| "-".into());
+        let fan = gpu.fan_pct.map(|f| format!("{f}%")).unwrap_or_else(|| "\u{2014}".into());
+        let util = gpu.util_pct.map(|u| format!("{u}%")).unwrap_or_else(|| "-".into());
+        cards.push_str(&format!(
+            r#"  <div class="gpu-card">
+    <div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> {name}</div>
+    <strong style="color:{colour};font-size:1.55rem;">{mem}<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>
+    <div class="gpu-metrics">
+      <div class="gpu-metric"><span class="gpu-label">Compute:</span>{util}</div>
+      <div class="gpu-metric"><span class="gpu-label">Temp:</span>{temp}</div>
+      <div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>{fan}</div>
+    </div>
+  </div>
+"#,
+            name = esc_attr(&gpu.name),
+            colour = colour,
+            mem = gpu.mem_pct,
+            util = esc_attr(&util),
+            temp = esc_attr(&temp),
+            fan = esc_attr(&fan),
+        ));
+    }
+
+    format!(
+        "<!-- GPU STATS -->\n<div class=\"gpu-section\" id=\"gpu-section\">\n  <div class=\"gpu-grid\" id=\"gpu-list\" data-live=\"{live}\">\n{cards}  </div>\n</div>\n"
+    )
+}
+
+/// `2026-10-16 15:42` — no chrono dependency for one timestamp.
+fn now_string() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
-    let mut html = include_str!("template.html").to_string();
-
-    // Step 1: Replace hostnames in all three spots
-    let hn = esc(&output.hostname).into_owned();
-    for _ in 0..3 {
-        html = html.replace("<!-- HOSTNAME -->", &hn);
-    }
-
-    // Step 1.5: Replace system info placeholder with static machine card
-    let machine = crate::machine::collect();
-    let total_ram_gb = machine.total_memory_mb as f64 / 1024.0;
-    let disk_pct = if machine.disk_total_gb > 0 {
-        (machine.disk_used_gb as f64 / machine.disk_total_gb as f64 * 100.0) as u8
-    } else { 0 };
-    let system_info_html = format!(
-        r#"<div class="gpu-card">
-  <div class="gpu-header"><span class="gpu-icon">&#x1F4BB;</span> System</div>
-  <div class="gpu-metrics">
-    <div class="gpu-metric"><span class="gpu-label">{os}</span>{ram:.1} GB</div>
-    <div class="gpu-metric"><span class="gpu-label">{cores} cores</span>{kernel}</div>
-    <div class="gpu-metric" style="grid-column:span 2"><span class="gpu-label">Disk</span> {disk_used}/{disk_total} GB ({disk_pct}%)</div>
-  </div>
-</div>"#,
-        os = machine.os.split_whitespace().next().unwrap_or("Linux"),
-        kernel = machine.kernel,
-        cores = machine.cpu_core_count,
-        ram = total_ram_gb,
-        disk_used = machine.disk_used_gb,
-        disk_total = machine.disk_total_gb,
-        disk_pct = disk_pct,
-    );
-    html = html.replace("<!-- SYSTEM_INFO -->", &system_info_html);
-
-    // Step 1.6: Replace Glances API URL placeholder
-    let glances_url = output.glances_api_base.as_deref().unwrap_or("http://localhost:61208");
-    html = html.replace("<!-- GLANCES_URL -->", glances_url);
-
-    // Step 2: Group services, preserving insertion order (use BTreeMap for deterministic ordering)
-    let mut svc_grouped: BTreeMap<String, Vec<&SplashService>> = BTreeMap::new();
-    for svc in &output.selected_services {
-        let key = group_key(svc);
-        svc_grouped.entry(key.into()).or_default().push(svc);
-    }
-
     let hostname = &output.hostname;
-
-    // Place known groups into template markers, unknown groups appended before footer
-    let mut custom_sections = Vec::new();
-    for (gname, svcs) in &svc_grouped {
-        match gname.as_str() {
-            "Host Services" => {
-                if html.contains("<!--GROUP_HOST_SERVICES-->") {
-                    html = html.replace("<!--GROUP_HOST_SERVICES-->", &format_group_section(gname, svcs, hostname));
-                }
-            }
-            "Remote & Guest VMs" => {
-                if html.contains("<!--GROUP_REMOTE_GUEST_VMS-->") {
-                    html = html.replace("<!--GROUP_REMOTE_GUEST_VMS-->", &format_group_section(gname, svcs, hostname));
-                }
-            }
-            _ => {
-                custom_sections.push(format_group_section(gname, svcs, hostname));
-            }
-        }
-    }
-
-    // Insert custom sections before footer if any exist
-    if !custom_sections.is_empty() {
-        let combined: String = custom_sections.join("");
-        html = html.replace("<!-- FOOTER -->", &format!("\n{}\n<!-- FOOTER -->", combined));
-    }
-    // Step 3: Fill title and IP from splash-meta.json
-    let meta_path = output.output_dir.join("splash-meta.json");
-    if let Ok(raw) = fs::read_to_string(&meta_path) {
-        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(t) = meta.get("title").and_then(|v| v.as_str()) {
-                html = html.replace("<span id=\"page-title\"></span>", t);
-                if let Some(ip) = meta.get("ip_display").and_then(|v| v.as_str()) {
-                    let ip_span = format!("<span class='subtitle-ip'>[{ip}]</span>");
-                    html = html.replace(
-                        "<p class=\"subtitle\">Quick-launch dashboard for monitored services</p>",
-                        &format!("Quick-launch dashboard for monitored services {ip_span}"),
-                    );
-                }
-            }
-        }
-    }
-
-    // Step 4: Footer
-    let ip_display = fs::read_to_string(&meta_path).ok()
-        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
-        .and_then(|m| m.get("ip_display").and_then(|x| x.as_str().map(String::from)))
-        .unwrap_or_else(|| "*".to_string());
-
-    let footer = format!("{} {} {} | powered by server-splash", output.hostname, "\u{2014}", ip_display);
-    html = html.replace("<!-- FOOTER -->", &esc(&footer));
-
-    // Step 5: Write to disk
     let out_dir = output.output_dir.clone();
     fs::create_dir_all(&out_dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
-    let out_path = out_dir.join("splash-server.html");
-    fs::write(&out_path, &html).map_err(|e| format!("Failed to write file: {e}"))?;
+
+    let mut html = include_str!("template.html").to_string();
+
+    let title = if output.title.is_empty() { hostname.clone() } else { output.title.clone() };
+    let subtitle = if output.subtitle.is_empty() {
+        "Quick-launch dashboard — services directory".to_string()
+    } else {
+        output.subtitle.clone()
+    };
+
+    html = html.replace("<!-- TITLE -->", &esc(&title));
+    html = html.replace("<!-- SUBTITLE -->", &esc(&subtitle));
+    html = html.replace(
+        "<!-- GROUPS -->",
+        &render_groups(&output.selected_services, hostname, output.inline_icons),
+    );
+    html = html.replace("<!-- GPU_SECTION -->", &render_gpu_section(output));
+    html = html.replace("<!-- SYS_CHIPS -->", &render_sys_chips(output));
+    html = html.replace("<!-- SYSPLASH_CONFIG -->", &resync_config(output, hostname));
+    html = html.replace("<!-- MODULES -->", &output.extra_cards.join(""));
+
+    let ip = if output.ip_display.is_empty() { "*".to_string() } else { output.ip_display.clone() };
+    let generated = now_string();
+    let stamp = if generated.is_empty() { String::new() } else { format!(" — generated {generated}") };
+
+    // The text parts are escaped, but this footer deliberately carries a real link, so
+    // it is assembled rather than escaped as a whole.
+    let footer_plain = format!(
+        "{hostname} — {ip}{stamp} | powered by server-splash (build {}) — ",
+        crate::build_stamp()
+    );
+    let footer_text = esc(&footer_plain);
+    html = html.replace(
+        "<!-- FOOTER -->",
+        &format!(
+            "{footer_text}<a href=\"{PHASESIT_URL}\" target=\"_blank\" rel=\"noopener noreferrer\">PhaseShift Studio</a>"
+        ),
+    );
+
+    if !output.inline_icons {
+        write_icons(output)?;
+    }
+    write_speedtest_payload(output)?;
+
+    let file_name = if output.output_file.is_empty() { "index.html".to_string() } else { output.output_file.clone() };
+    let out_path = out_dir.join(&file_name);
+    write_atomic(&out_path, html.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", out_path.display()))?;
+
+    // Machine-readable companion, useful for other tooling and for tests. It is
+    // deliberately excluded from deploys (see main.rs) because it lists every port.
+    write_dashboard_json(output, &title, &subtitle, &generated);
 
     Ok(out_path.to_string_lossy().to_string())
+}
+
+fn write_dashboard_json(output: &WizardOutput, title: &str, subtitle: &str, generated: &str) {
+    let services: Vec<serde_json::Value> = output
+        .selected_services
+        .iter()
+        .filter(|s| !s.hidden)
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "desc": s.desc,
+                "icon": s.icon,
+                "icon_is_image": is_image_icon(&s.icon),
+                "protocol": s.protocol,
+                "port": s.port,
+                "group": s.group,
+                "local_only": s.local_only,
+                "source": s.source,
+                "web_probe_url": s.web_probe_url,
+                "alive_at_generation": s.alive,
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "generated_at": generated,
+        "generator_build": crate::build_stamp(),
+        "hostname": output.hostname,
+        "ip": output.ip_display,
+        "title": title,
+        "subtitle": subtitle,
+        "glances_api_base": output.glances_api_base,
+        "services": services,
+    });
+
+    if let Ok(text) = serde_json::to_string_pretty(&doc) {
+        let _ = fs::write(output.output_dir.join("dashboard.json"), text);
+    }
 }
 
 /// Build an HTML link card for a dashboard module to inject into the splash page.
@@ -277,14 +547,545 @@ pub(crate) fn module_card(
     name: &str,
     desc: &str,
     port: u16,
-    service_port: u16
 ) -> String {
     format!(
-        r#"<a class="card service-card status-up" href="{url_prefix}/index.html">
-<span class='status-badge'></span>
-<span class='icon'>{icon}</span>
-<div class='info'><span class='name'>{name}</span><br><span class='desc'>{desc}</span></div>
-<div class='link-wrap'><span class='protocol'>http:</span><span>{port}</span></div>
-</a>"#
+        r#"<a class="card status-unknown" href="{url_prefix}/index.html" data-probe="none" data-service="{name}">
+  <span class="status-icon" aria-hidden="true">&#x25CF;</span>
+  <span class="icon">{icon}</span>
+  <div class="info"><span class="name">{name}</span><br><span class="desc">{desc}</span></div>
+  <div class="link-wrap"><span class="protocol">http:</span><span class="link">:{port}</span></div>
+</a>
+"#,
+        url_prefix = esc_attr(url_prefix),
+        icon = esc_attr(icon),
+        name = esc_attr(name),
+        desc = esc_attr(desc),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn svc(name: &str, port: Option<&str>, group: &str) -> SplashService {
+        SplashService {
+            name: name.to_string(),
+            desc: format!("{name} description"),
+            icon: "🌐".to_string(),
+            protocol: "http".to_string(),
+            port: port.map(String::from),
+            group: group.to_string(),
+            web_probe_url: port.map(|p| format!("http://ginger.local:{p}/")),
+            ..SplashService::blank()
+        }
+    }
+
+    fn output_with(services: Vec<SplashService>) -> WizardOutput {
+        WizardOutput {
+            output_dir: std::env::temp_dir(),
+            hostname: "ginger.local".to_string(),
+            title: "ginger.local".to_string(),
+            subtitle: "Dual RTX 3090 — Linux Mint 22.3 — services directory".to_string(),
+            ip_display: "192.168.1.72".to_string(),
+            selected_services: services,
+            _probe_results: Vec::new(),
+            selected_modules: Vec::new(),
+            glances_api_base: Some("http://ginger.local:61208".to_string()),
+            deploy_path: None,
+            output_file: "index.html".to_string(),
+            extra_cards: Vec::new(),
+            gpus: Vec::new(),
+            sys_chips: Vec::new(),
+            speedtest_bytes: 0,
+            overrides_path: std::path::PathBuf::from("/nonexistent/overrides.toml"),
+            inline_icons: true,
+        }
+    }
+
+    #[test]
+    fn host_services_render_before_remote_services() {
+        let out = output_with(vec![
+            svc("Hermes Web", Some("9119"), "Remote & Guest VMs"),
+            svc("Ollama", Some("11434"), "Host Services"),
+        ]);
+        let html = render_groups(&out.selected_services, &out.hostname, true);
+        let host = html.find("Host Services").expect("host heading");
+        let remote = html.find("Remote &amp; Guest VMs").or_else(|| html.find("Remote & Guest VMs")).expect("remote heading");
+        assert!(host < remote, "explicit ordering, not alphabetical: {html}");
+    }
+
+    #[test]
+    fn local_only_services_are_not_links() {
+        let mut s = svc("CUPS", Some("631"), "Host Services");
+        s.local_only = true;
+        let html = render_card(&s, "ginger.local", true);
+        assert!(!html.contains("<a "), "a loopback-only service must not be clickable: {html}");
+        assert!(html.contains("localhost only"));
+    }
+
+    #[test]
+    fn non_http_services_are_not_http_links() {
+        let mut sql = svc("MySQL", Some("3306"), "Host Services");
+        sql.protocol = "tcp".to_string();
+        sql.web_probe_url = None;
+        let html = render_card(&sql, "ginger.local", true);
+        assert!(html.starts_with("<div"), "a tcp service must not be an <a>: {html}");
+        assert!(!html.contains("http://"), "no fake http link: {html}");
+        assert!(html.contains("no-link"));
+        assert!(html.contains("tcp:") && html.contains(":3306"), "port still shown: {html}");
+
+        // ssh/vnc/mqtt remain real links, with the right scheme.
+        let mut ssh = svc("SSH", Some("22"), "Host Services");
+        ssh.protocol = "ssh".to_string();
+        ssh.web_probe_url = None;
+        let html = render_card(&ssh, "ginger.local", true);
+        assert!(html.contains(r#"href="ssh://ginger.local:22""#), "{html}");
+        assert!(!html.contains("data-probe"), "ssh cannot be health-checked from the browser: {html}");
+    }
+
+    #[test]
+    fn daemon_only_services_render_as_divs() {
+        let mut s = svc("Docker Engine", None, "Host Services");
+        s.web_probe_url = None;
+        let html = render_card(&s, "ginger.local", true);
+        assert!(html.starts_with("<div"), "{html}");
+        assert!(html.contains("daemon only"));
+    }
+
+    #[test]
+    fn http_cards_carry_a_live_probe_url() {
+        let s = svc("Ollama", Some("11434"), "Host Services");
+        let html = render_card(&s, "ginger.local", true);
+        assert!(html.contains(r#"href="http://ginger.local:11434""#), "{html}");
+        assert!(html.contains(r#"data-probe="http://ginger.local:11434/""#), "{html}");
+    }
+
+    #[test]
+    fn initial_status_reflects_the_generation_time_probe() {
+        let mut up = svc("Ollama", Some("11434"), "Host Services");
+        up.alive = true;
+        assert!(render_card(&up, "h", true).contains("card status-up"));
+
+        let mut down = svc("Ghost", Some("9999"), "Host Services");
+        down.alive = false;
+        assert!(render_card(&down, "h", true).contains("card status-down"));
+    }
+
+    #[test]
+    fn footer_carries_the_studio_link_and_the_build_stamp() {
+        let dir = std::env::temp_dir().join("splash-footer-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = output_with(vec![]);
+        out.output_dir = dir.clone();
+        let page = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&page).unwrap();
+
+        let footer = html.split("<footer>").nth(1).unwrap().split("</footer>").next().unwrap();
+        assert!(footer.contains(r#"<a href="https://phaseshift.studio""#), "{footer}");
+        assert!(footer.contains(">PhaseShift Studio</a>"), "{footer}");
+        assert!(footer.contains("powered by server-splash (build "), "{footer}");
+        assert!(footer.contains("ginger.local — 192.168.1.72"), "{footer}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writes_are_atomic() {
+        let dir = std::env::temp_dir().join("splash-atomic-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.html");
+
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("tmp-write").exists(), "no debris left behind");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hidden_services_are_omitted() {
+        let mut s = svc("Secret", Some("1234"), "Host Services");
+        s.hidden = true;
+        let html = render_groups(&[s], "ginger.local", true);
+        assert!(!html.contains("Secret"), "{html}");
+    }
+
+    #[test]
+    fn generated_page_has_no_placeholders_left() {
+        let dir = std::env::temp_dir().join("splash-generator-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = output_with(vec![svc("Ollama", Some("11434"), "Host Services")]);
+        out.output_dir = dir.clone();
+
+        let path = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        for placeholder in [
+            "<!-- TITLE -->",
+            "<!-- SUBTITLE -->",
+            "<!-- GROUPS -->",
+            "<!-- MODULES -->",
+            "<!-- FOOTER -->",
+        ] {
+            assert!(!html.contains(placeholder), "{placeholder} was not substituted");
+        }
+        assert!(html.contains("<title>ginger.local</title>"));
+        assert!(html.contains("powered by server-splash"));
+        assert!(html.contains("192.168.1.72"));
+        // The machine-readable companion is written alongside.
+        let meta = std::fs::read_to_string(dir.join("dashboard.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["services"][0]["name"], "Ollama");
+        assert_eq!(parsed["services"][0]["port"], "11434");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Renders the *real* `ginger` inventory — the ports and titles the deployed page
+    /// actually shows — so the output can be eyeballed against what is live. Also
+    /// asserts the shape of the result, which is what protects against regressions.
+    /// The preview lands in `target/preview/ginger.html`.
+    #[test]
+    fn renders_a_preview_of_the_real_ginger_inventory() {
+        use crate::discover::{DiscoveredService, FetchedIcon, HttpInfo};
+
+        /// How one live service presents itself to discovery.
+        struct Live {
+            port: u16,
+            proc: Option<&'static str>,
+            unit: Option<&'static str>,
+            container: Option<&'static str>,
+            image: Option<&'static str>,
+            title: Option<&'static str>,
+            favicon: Option<&'static str>,
+        }
+        let none = |port: u16| Live { port, proc: None, unit: None, container: None, image: None, title: None, favicon: None };
+
+        let inventory: Vec<Live> = vec![
+            Live { proc: Some("sshd"), ..none(22) },
+            // Apache publishes a favicon, but a recognised service keeps its catalog icon.
+            Live { proc: Some("apache2"), title: Some("Apache2 Ubuntu Default Page"), favicon: Some("ico"), ..none(80) },
+            Live { proc: Some("mosquitto"), ..none(1883) },
+            // Docker forwards every published port through a process of this name; it
+            // must not become the service's identity.
+            Live { container: Some("dockge"), image: Some("louislam/dockge:1"), proc: Some("docker-proxy"), favicon: Some("ico"), ..none(5001) },
+            Live { container: Some("mariadb"), image: Some("mariadb:11.2"), proc: Some("docker-proxy"), ..none(3306) },
+            Live { container: Some("chromadb"), proc: Some("docker-proxy"), image: Some("chromadb/chroma:1.5.3"), ..none(8025) },
+            Live { proc: Some("something"), title: Some("Some Internal Tool"), favicon: Some("png"), ..none(8080) },
+            Live { container: Some("ollama"), proc: Some("docker-proxy"), image: Some("ollama/ollama"), ..none(8082) },
+            // metatron: recognised by container name, and again by page title on 8777.
+            Live { container: Some("metatron"), proc: Some("docker-proxy"), ..none(8555) },
+            Live { container: Some("weird-name"), image: Some("ghcr.io/phaseshift-studio/metatron:main"), title: Some("metatron — PhaseShift Studio"), ..none(8777) },
+            Live { container: Some("prometheus"), proc: Some("docker-proxy"), ..none(9090) },
+            Live { container: Some("all-smi"), proc: Some("docker-proxy"), ..none(9091) },
+            // Above the kernel's ephemeral range (32768-60999) and previously filtered
+            // out as if it were a throwaway test port.
+            Live { container: Some("glances"), proc: Some("glances"), ..none(61208) },
+            Live { container: Some("hindsight"), proc: Some("docker-proxy"), favicon: Some("png"), ..none(9999) },
+            Live { container: Some("ollama"), proc: Some("docker-proxy"), image: Some("ollama/ollama"), ..none(11434) },
+            Live { title: Some("Docker Application Container Engine"), ..none(11435) },
+            Live { container: Some("nginx-proxy"), proc: Some("docker-proxy"), ..none(11437) },
+            Live { container: Some("uvicorn-app"), proc: Some("docker-proxy"), ..none(11599) },
+        ];
+
+        let catalog = crate::catalog::Catalog::load(std::path::Path::new("/nonexistent/overrides.toml"));
+        let services: Vec<SplashService> = inventory
+            .iter()
+            .filter_map(|l| {
+                let mut d = DiscoveredService {
+                    port: l.port,
+                    remote_reachable: true,
+                    proc_name: l.proc.map(String::from),
+                    pid: None,
+                    unit: l.unit.map(String::from),
+                    unit_desc: None,
+                    container: l.container.map(String::from),
+                    image: l.image.map(String::from),
+                    http: None,
+                };
+                if l.title.is_some() || l.favicon.is_some() || l.container.is_some() {
+                    d.http = Some(HttpInfo {
+                        scheme: "http".into(),
+                        status: 200,
+                        server: Some("nginx".into()),
+                        title: l.title.map(String::from),
+                        icon: l.favicon.map(|ext| FetchedIcon {
+                            // Real bytes: a stub that is not a decodable image renders
+                            // as a broken-image box in the preview.
+                            bytes: include_bytes!("assets/metatron.png").to_vec(),
+                            ext: ext.to_string(),
+                            source: format!("http://127.0.0.1:{}/favicon.{}", l.port, ext),
+                        }),
+                    });
+                }
+                catalog.resolve(&d, "ginger.local", true)
+            })
+            .collect();
+
+        assert_eq!(services.len(), inventory.len(), "every discovered port should resolve to a card");
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/preview");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let out = WizardOutput {
+            output_dir: dir,
+            output_file: "ginger.html".into(),
+            hostname: "ginger.local".into(),
+            title: "ginger.local".into(),
+            subtitle: "Dual RTX 3090 — Linux Mint 22.3 — services directory".into(),
+            ip_display: "192.168.1.72".into(),
+            selected_services: services,
+            _probe_results: Vec::new(),
+            selected_modules: Vec::new(),
+            glances_api_base: Some("http://ginger.local:61208".into()),
+            deploy_path: None,
+            extra_cards: Vec::new(),
+            gpus: vec![
+                crate::discover::Gpu { name: "NVIDIA GeForce RTX 3090".into(), mem_pct: 59, temp_c: Some(53), fan_pct: Some(47), util_pct: Some(0) },
+                crate::discover::Gpu { name: "NVIDIA GeForce RTX 3090".into(), mem_pct: 57, temp_c: Some(37), fan_pct: Some(0), util_pct: Some(12) },
+                crate::discover::Gpu { name: "AMD GPU".into(), mem_pct: 0, temp_c: Some(46), fan_pct: None, util_pct: Some(0) },
+            ],
+            sys_chips: vec![
+                "64 GB RAM".into(),
+                "12 TB across 3 disks".into(),
+                "24 cores".into(),
+                "eno1 1 Gb/s".into(),
+            ],
+            speedtest_bytes: 8 * 1024 * 1024,
+            overrides_path: std::path::PathBuf::from("/nonexistent/overrides.toml"),
+            inline_icons: true,
+        };
+        let path = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+
+        // Everything should be identified, and nothing should look like a guess.
+        // Match a rendered card, not the resync script's own fallback template.
+        assert!(!html.contains(r#"data-service="Service on :"#), "nothing should fall through: {path}");
+
+        // The service-agnostic globe should be rare now: only the genuinely unknown
+        // port 8080 should still carry it.
+        let globes = html.matches(">🌐<").count();
+        assert!(globes <= 1, "only the unidentified service should still show a globe, found {globes}");
+
+        // Spot-check the icons this iteration was about.
+        assert!(html.contains("🪶"), "Apache should get the feather");
+        // metatron's logo (both cards) and the unknown service's favicon are images;
+        // everything else is an emoji.
+        // Count rendered images, not the CSS class or the resync script's template.
+        assert_eq!(
+            html.matches(r#"src="data:image/png;base64,"#).count(),
+            3,
+            "two metatron cards + the 8080 favicon",
+        );
+        assert!(html.contains(r#"<img class="icon-img" src="data:image/png;base64,"#), "icons travel inside the page");
+        assert!(!html.contains(r#"src="icons/"#), "no reference that could fail to resolve");
+        assert!(html.contains("🎛️"), "all-smi should get its own icon");
+        assert!(html.contains("🧠"), "Hindsight is recognised, so it keeps its catalog icon over its favicon");
+
+        // Every container port is forwarded by docker-proxy; none may be named "Docker"
+        // for that reason, and the tool actually listening must be named instead.
+        assert!(html.contains(">Dockge<"), "Dockge must be named, not its Docker forwarding process");
+        assert!(html.contains(">MariaDB<"), "nor may MariaDB be swallowed by Docker");
+        // Glances listens on 61208, above the ephemeral range: it must reach the page.
+        assert!(html.contains(">Glances<"), "Glances must survive the ephemeral filter");
+        assert!(html.contains(r#"href="http://ginger.local:61208""#));
+
+        // Liveness, GPUs and links.
+        assert!(html.contains("card status-up"), "HTTP services were up when sampled");
+        assert!(html.contains(r#"data-live="http://ginger.local:61208""#), "GPU cards poll Glances");
+        assert!(html.contains("59"), "VRAM is baked in from nvidia-smi");
+        assert!(html.contains(r#"href="ssh://ginger.local:22""#));
+        assert!(html.contains(r#"href="http://ginger.local:11434""#));
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn system_chips_are_rendered_under_the_title() {
+        let mut out = output_with(vec![]);
+        out.sys_chips = vec!["64 GB RAM".into(), "4.0 TB across 3 disks".into(), "eno1 1 Gb/s".into()];
+        let html = render_sys_chips(&out);
+        assert_eq!(html.matches("class=\"chip\"").count(), 3);
+        assert!(html.contains("64 GB RAM"));
+        assert!(html.contains("4.0 TB across 3 disks"));
+
+        // A machine we could learn nothing about renders no chips at all rather than
+        // a row of placeholders.
+        let empty = output_with(vec![]);
+        assert_eq!(render_sys_chips(&empty), "");
+    }
+
+    #[test]
+    fn the_page_carries_a_usable_resync_config() {
+        let mut out = output_with(vec![
+            svc("Ollama", Some("11434"), "Host Services"),
+            svc("metatron", Some("8555"), "Host Services"),
+        ]);
+        out.speedtest_bytes = 4 * 1024 * 1024;
+        let json = resync_config(&out, "ginger.local");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+
+        assert_eq!(parsed["host"], "ginger.local");
+        assert_eq!(parsed["speedtest"]["file"], "speedtest.bin");
+        assert_eq!(parsed["speedtest"]["bytes"], 4194304);
+
+        let known: Vec<u64> = parsed["knownPorts"].as_array().unwrap()
+            .iter().map(|v| v.as_u64().unwrap()).collect();
+        assert!(known.contains(&11434) && known.contains(&8555), "existing ports are not re-added: {known:?}");
+
+        let candidates = parsed["candidates"].as_array().unwrap();
+        assert!(candidates.len() > 80);
+
+        // The catalog must let the browser name what it finds.
+        let catalog = parsed["catalog"].as_array().unwrap();
+        let ollama = catalog.iter().find(|e| e["port"] == 11434).unwrap();
+        assert_eq!(ollama["name"], "Ollama");
+        assert_eq!(ollama["icon"], "🦙");
+
+        // A speed test is disabled by an explicit zero rather than a missing file.
+        let mut off = output_with(vec![]);
+        off.speedtest_bytes = 0;
+        let parsed: serde_json::Value = serde_json::from_str(&resync_config(&off, "h")).unwrap();
+        assert_eq!(parsed["speedtest"]["file"], "");
+
+        // `<` can never appear raw, or a value could close the surrounding <script>.
+        assert!(!json.contains('<'), "JSON embedded in HTML must escape <");
+    }
+
+    #[test]
+    fn speedtest_payload_is_written_once_at_the_right_size() {
+        let dir = std::env::temp_dir().join("splash-speedtest");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut out = output_with(vec![]);
+        out.output_dir = dir.clone();
+        out.speedtest_bytes = 64 * 1024;
+        write_speedtest_payload(&out).unwrap();
+        let path = dir.join("speedtest.bin");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
+
+        // The payload must not be trivially compressible, or a proxy would serve a
+        // small copy and the measurement would read far higher than the real link.
+        let sample = std::fs::read(&path).unwrap();
+        let distinct: std::collections::HashSet<u8> = sample.into_iter().collect();
+        assert!(distinct.len() > 200, "payload should look random, saw {} distinct bytes", distinct.len());
+
+        // Rewriting is skipped when the size already matches, so a 15-minute timer
+        // does not push megabytes through the disk every quarter hour.
+        std::fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
+        write_speedtest_payload(&out).unwrap();
+        assert!(std::fs::read(&path).unwrap().iter().all(|b| *b == 0), "unchanged when the size matches");
+
+        // Zero disables it entirely.
+        let mut off = output_with(vec![]);
+        off.output_dir = dir.clone();
+        off.speedtest_bytes = 0;
+        std::fs::remove_file(&path).unwrap();
+        write_speedtest_payload(&off).unwrap();
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn distinguishes_image_icons_from_emoji() {
+        assert!(is_image_icon("icons/metatron.png"));
+        assert!(is_image_icon("icons/8080.ico"));
+        assert!(is_image_icon("https://example.com/a.svg"));
+        assert!(!is_image_icon("🦙"));
+        assert!(!is_image_icon("🌐"));
+        assert!(!is_image_icon(""));
+    }
+
+    /// The base64 encoder is hand-rolled, so it is pinned against known vectors.
+    #[test]
+    fn base64_matches_the_reference_encoding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0x89, 0x50, 0x4E, 0x47]), "iVBORw==", "real PNG magic");
+        assert_eq!(mime_for("a.png"), "image/png");
+        assert_eq!(mime_for("a.JPG"), "image/jpeg");
+        assert_eq!(mime_for("a.svg"), "image/svg+xml");
+        assert_eq!(mime_for("a.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn image_icons_are_embedded_by_default_and_linked_on_request() {
+        let mut s = svc("metatron", Some("8555"), "Host Services");
+        s.icon = "icons/metatron.png".to_string();
+
+        // Embedded: the bytes travel with the page, so it renders wherever it is
+        // served from — a preview, a subdirectory, file:// — and cannot 403.
+        let embedded = render_card(&s, "ginger.local", true);
+        assert!(embedded.contains(r#"<img class="icon-img" src="data:image/png;base64,"#), "{embedded}");
+        assert!(!embedded.contains(r#"src="icons/"#), "no path that can fail to resolve: {embedded}");
+        assert!(!embedded.contains("srcset"), "the 2x bytes are already the embedded source");
+
+        // The 2x asset is preferred when embedding, for a sharp result on any display.
+        let two_x = include_bytes!("assets/metatron@2x.png");
+        assert!(embedded.contains(&base64(two_x)), "should embed the 2x asset");
+
+        // Opting out restores file references with a retina srcset.
+        let linked = render_card(&s, "ginger.local", false);
+        assert!(linked.contains(r#"src="icons/metatron.png""#), "{linked}");
+        assert!(linked.contains(r#"srcset="icons/metatron@2x.png 2x""#), "{linked}");
+
+        let emoji = svc("Ollama", Some("11434"), "Host Services");
+        assert!(render_card(&emoji, "h", true).contains("<span class=\"icon\">🌐</span>"));
+    }
+
+    #[test]
+    fn fetched_icons_are_embedded_or_written_out() {
+        let png = include_bytes!("assets/metatron.png").to_vec();
+
+        let mut with_icon = svc("Chromadb", Some("8025"), "Host Services");
+        with_icon.icon = "icons/8025.png".to_string();
+        with_icon.icon_data = Some(png.clone());
+
+        // Embedded (the default): no icons directory is needed at all.
+        let dir = std::env::temp_dir().join("splash-icons-inline");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = output_with(vec![with_icon.clone()]);
+        out.output_dir = dir.clone();
+        let page = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&page).unwrap();
+        assert!(html.contains(&base64(&png)), "the service's own icon is inside the page");
+        assert!(!dir.join("icons").exists(), "no icons dir when embedding");
+
+        // Opted out: files are written and referenced.
+        let dir2 = std::env::temp_dir().join("splash-icons-files");
+        std::fs::remove_dir_all(&dir2).ok();
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut out2 = output_with(vec![with_icon]);
+        out2.output_dir = dir2.clone();
+        out2.inline_icons = false;
+        let page2 = generate(&out2).unwrap();
+        let html2 = std::fs::read_to_string(&page2).unwrap();
+        assert!(dir2.join("icons").join("metatron.png").exists(), "bundled icons ship with the files");
+        assert!(dir2.join("icons").join("8025.png").exists(), "fetched icons are mirrored");
+        assert!(html2.contains("icons/8025.png"), "{html2}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn no_dead_logs_modal_reference_remains() {
+        // The original page shipped a modal that fetched /api/logs, which nothing ever
+        // served. Regenerating a page that advertises a 404 endpoint is worse than
+        // having no logs feature at all.
+        let template = include_str!("template.html");
+        assert!(!template.contains("/api/logs"), "the dead logs endpoint must stay gone");
+        assert!(template.contains("data-probe"), "the live status probe must be wired up");
+        assert!(!template.contains("openservice("), "the broken click handler must stay gone");
+    }
 }

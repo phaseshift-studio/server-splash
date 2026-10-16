@@ -5,7 +5,7 @@ pub(crate) fn generate(
     output_dir: &Path,
     hostname: &str,
     port: u16,
-    service_port: u16,
+    _service_port: u16,
     _glances_port: Option<u16>,
 ) -> Result<String, String> {
     let mut html = include_str!("template.html").to_string();

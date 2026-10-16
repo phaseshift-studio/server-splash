@@ -4,20 +4,24 @@
 <meta charset="UTF-8">
 <link rel="icon" href="/favicon.ico" type="image/x-icon">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title><!-- HOSTNAME --> Services</title>
+<title><!-- TITLE --></title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #1a1b26; color: #a9b1d6; padding: 3rem 2rem; }
   h1 { font-size: 2.4rem; color: #c0caf5; margin-bottom: .25rem; letter-spacing: -.02em; }
-  .subtitle { color: #565f89; margin-bottom: 3rem; font-size: .95rem; }
+  .subtitle { color: #565f89; margin-bottom: .9rem; font-size: .95rem; }
+
+  /* system facts under the title */
+  .sysbar { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1rem; }
+  .chip { background: #1e2030; border: 1px solid #292e42; color: #7aa2f7; border-radius: 999px; padding: .25rem .7rem; font-size: .75rem; white-space: nowrap; }
+  .chip-live { color: #9ece6a; border-color: #2c4a2c; }
   h2 { color: #7aa2f7; font-size: 1.1rem; text-transform: uppercase; letter-spacing: .08em; margin: 2.5rem 0 1rem; border-bottom: 1px solid #292e42; padding-bottom: .5rem; }
   a { color: #9ece6a; text-decoration: none; transition: color .15s, background-color .15s; }
   a:hover { color: #b9f27c; }
 
   /* GPU section */
-  .gpu-section { margin: 1rem 0 2.5rem; }
+  .gpu-section { margin: 0 0 2rem; }
   .gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .65rem; }
-  #gpu-list { display: contents; }
   .gpu-card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: .85rem 1.1rem; transition: border-color .15s; }
   .gpu-card:hover { border-color: #7aa2f7; }
   .gpu-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .45rem; color: #c0caf5; font-weight: 600; font-size: .88rem; }
@@ -25,169 +29,328 @@
   .gpu-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: .35rem; margin-top: .5rem; }
   .gpu-metric { background: #16161ef0; padding: .35rem .55rem; border-radius: 4px; font-size: .72rem; color: #7aa2f7; }
   .gpu-label { color: #565f89; margin-right: .25rem; }
+  .gpu-note { color: #3d425a; font-size: .72rem; }
 
-  /* health states */
+  /* service cards + health states */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: .75rem; }
   .card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: 1rem 1.25rem; display: flex; align-items: center; gap: .6rem; transition: border-color .15s, background-color .3s; position: relative; }
   .card:hover { border-color: #7aa2f7; cursor: pointer; }
   .card.status-unknown { border-color: #3d425a; }
   .card.status-down { border-color: #ff6e6e; background: linear-gradient(135deg, #3b1515 0%, #1e2030 40%); cursor: default; }
+  .card.status-down:hover { border-color: #ff6e6e; }
+  .card.local-only { cursor: default; }
+  .card.local-only:hover { border-color: #292e42; }
+  /* A card with no link (a database or file-sharing port) must not look clickable. */
+  .card.no-link:hover { border-color: #292e42; cursor: default; }
 
   @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
-  .status-icon { font-size: .7rem; width: auto; height: auto; text-align: center; flex-shrink: 0; transition: color .3s; position: absolute; top: .65rem; right: .75rem; }
+  .status-icon { font-size: .8rem; line-height: 1; text-align: center; flex-shrink: 0; transition: color .3s; position: absolute; top: .65rem; right: .75rem; }
   .card.status-unknown .status-icon { color: #565f89; }
   .card.status-down .status-icon { color: #ff6e6e; animation: pulse-red 2s infinite; }
   .card.status-up .status-icon { color: #9ece6a; }
 
   .icon { font-size: 1.6rem; display: inline-flex; align-items: center; flex-shrink: 0; }
+  /* Icons the service publishes about itself, mirrored locally at generate time. */
+  .icon-img { width: 1.7rem; height: 1.7rem; object-fit: contain; border-radius: 3px; }
   .info { flex: 1; min-width: 0; }
   .name { color: #c0caf5; font-weight: 600; font-size: .95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .desc { color: #565f89; font-size: .78rem; margin-top: .15rem; }
 
-  /* modal */
-  .modal-overlay { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.4); backdrop-filter: blur(4px); align-items: center; justify-content: center; }
-  .modal-overlay.open { display: flex !important; }
-  .modal-box { width: min(780px, 92vw); max-height: 70vh; background: #1e2030; border: 1px solid #414868; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
-  .modal-header { display: flex; align-items: center; justify-content: space-between; padding: .75rem 1rem; background: #292e42; border-bottom: 1px solid #414868; }
-  .modal-title { color: #c0caf5; font-weight: 600; font-size: .95rem; }
-  .modal-close { background: none; border: none; color: #7aa2f7; cursor: pointer; font-size: 1.1rem; padding: 0 .25rem; line-height: 1; transition: color .15s; }
-  .modal-close:hover { color: #b9f6a7; }
-  .modal-body { overflow-y: auto; flex: 1; font-family: monospace; font-size: .72rem; line-height: 1.45; background: #0d0d15; padding: .75rem; color: #9ece6a; }
-  .modal-body::-webkit-scrollbar { width: 6px; }
-  .modal-body::-webkit-scrollbar-track { background: transparent; }
-  .modal-body::-webkit-scrollbar-thumb { background: #3d425a; border-radius: 3px; }
-
-</style>
-<style>
   .link-wrap { display: flex; align-items: center; gap: .4rem; flex-shrink: 0; text-align: right; }
-  .link { color: #7aa2f7; font-size: .75rem; white-space: nowrap; text-decoration: none; transition: color .15s; }
-  .link:hover { color: #b9f27c; }
+  .link { color: #7aa2f7; font-size: .75rem; white-space: nowrap; }
   .protocol { color: #565f89; margin-right: .25rem; font-weight: normal; }
+  .locked { color: #565f89; font-size: .72rem; white-space: nowrap; }
   footer { margin-top: 3rem; color: #3d425a; font-size: .72rem; text-align: center; }
+  footer a { color: #565f89; text-decoration: none; border-bottom: 1px dotted #3d425a; }
+  footer a:hover { color: #7aa2f7; border-bottom-color: #7aa2f7; }
+  .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: .5rem; margin: 0 0 1.25rem; flex-wrap: wrap; }
+  .toolbar-note { color: #565f89; font-size: .72rem; margin-right: auto; }
+  .toolbar button:disabled { opacity: .45; cursor: default; }
+  .toolbar button { background: #1e2030; border: 1px solid #292e42; color: #7aa2f7; border-radius: 5px; padding: .3rem .7rem; font-size: .72rem; cursor: pointer; font-family: inherit; }
+  .toolbar button:hover { border-color: #7aa2f7; color: #b9f27c; }
 </style>
 </head>
 <body>
 
-<h1><!-- HOSTNAME --></h1>
-<p class="subtitle">Quick-launch dashboard — services directory</p>
+<h1><!-- TITLE --></h1>
+<p class="subtitle"><!-- SUBTITLE --></p>
 
-<!-- GPU STATS -->
-<div class="gpu-section">
-  <div class="gpu-grid" id="gpu-top-row">
-    <!-- SYSTEM_INFO -->
-    <div id="gpu-list"></div>
-  </div>
+<div class="sysbar">
+<!-- SYS_CHIPS -->
+  <span class="chip chip-live" id="speed-chip" hidden></span>
 </div>
 
-<h2>&#x2699;&#xFE0F; Host Services</h2>
-<div class="grid" id="host-grid">
-<!--GROUP_HOST_SERVICES-->
+<div class="toolbar">
+  <span class="toolbar-note" id="toolbar-note"></span>
+  <button id="speedtest" type="button">Test speed</button>
+  <button id="refresh" type="button">Re-check status</button>
+  <button id="resync" type="button">Resync with server</button>
 </div>
 
-<h2>&#x1F3E1;&#xFE0F; Remote &amp; Guest VMs</h2>
-<div class="grid" id="remote-grid">
-<!--GROUP_REMOTE_GUEST_VMS-->
-</div>
+<!-- GPU_SECTION -->
 
-<!-- LOGS MODAL -->
-<div class="modal-overlay" id="logs-modal-overlay" onclick="closeModal()">
-  <div class="modal-box" onclick="event.stopPropagation()">
-    <div class="modal-header">
-      <span class="modal-title" id="modal-service">Service Logs</span>
-      <button class="modal-close" onclick="closeModal()">&#x2715;</button>
-    </div>
-    <div class="modal-body" id="modal-body">Loading...</div>
-  </div>
-</div>
+<!-- GROUPS -->
+
+<!-- MODULES -->
+
+<footer><!-- FOOTER --></footer>
 
 <script>
-// ── GPU Stats from Glances API ──
+// ─────────────────────────── service health ───────────────────────────
+// Every card carrying a data-probe URL is tested from the browser, so the page
+// shows what is actually up right now rather than what was up when it was built.
+// Mode 'no-cors' is deliberate: we only care whether the port answers at all, and
+// the target usually sends no CORS headers.
+const PROBE_TIMEOUT_MS = 4000;
+
+// Everything the browser needs to re-discover services on its own, written into the
+// page by the generator. Without this a "resync" could only re-show the last build.
+const SYSPLASH = <!-- SYSPLASH_CONFIG -->;
+
+function setStatus(card, state) {
+  card.classList.remove('status-up', 'status-down', 'status-unknown');
+  card.classList.add('status-' + state);
+  const icon = card.querySelector('.status-icon');
+  if (icon) {
+    icon.textContent = '\u25CF'; // ●
+    icon.title = state === 'up' ? 'reachable' : state === 'down' ? 'not reachable' : 'unknown';
+  }
+}
+
+async function probeCard(card) {
+  const url = card.dataset.probe;
+  if (!url || url === 'none') { setStatus(card, 'unknown'); return; }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: controller.signal });
+    setStatus(card, 'up');
+  } catch (e) {
+    setStatus(card, 'down');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function refreshStatus() {
+  document.querySelectorAll('.card[data-probe]').forEach(probeCard);
+}
+
+// ─────────────────────────── GPU stats ───────────────────────────
 function renderGPUs() {
   const container = document.getElementById('gpu-list');
+  const api = container ? container.dataset.live : '';
+  // The cards are pre-filled from nvidia-smi at build time; only poll when a Glances
+  // API is configured *and* reachable from this browser.
+  if (!container || !api) return;
 
-  fetch('<!-- GLANCES_URL -->/api/4/gpu')
+  fetch(api + '/api/4/gpu')
     .then(r => r.json())
     .then(gpuData => {
       if (!Array.isArray(gpuData) || gpuData.length === 0) {
-        container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
+        container.innerHTML = '<span class="gpu-note">GPU stats unavailable</span>';
         return;
       }
       let html = '';
       for (const gpu of gpuData) {
-        if (gpu && gpu.key == 'gpu_id') {
-          const name = gpu.name ? gpu.name.replace(/ /g, '<wbr>') : 'GPU';
-          const memPct = Math.round((gpu.mem || 0));
-          const proc = gpu.proc ?? '-';
-          const temp = gpu.temperature != null ? gpu.temperature + '\u00B0C' : '-';
-          const fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '—';
+        if (!gpu || gpu.key !== 'gpu_id') continue;
+        const name = gpu.name ? gpu.name.replace(/ /g, '<wbr>') : 'GPU';
+        const memPct = Math.round(gpu.mem || 0);
+        const proc = gpu.proc ?? '-';
+        const temp = gpu.temperature != null ? gpu.temperature + '\u00B0C' : '-';
+        const fan = gpu.fan_speed != null ? gpu.fan_speed + '%' : '\u2014';
 
-          let loadColor = '#9ece6a';
-          if (memPct > 80) loadColor = '#ff6e6a';
-          else if (memPct > 40) loadColor = '#e5f07a';
+        let loadColor = '#9ece6a';
+        if (memPct > 80) loadColor = '#ff6e6a';
+        else if (memPct > 40) loadColor = '#e5f07a';
 
-          html += `
-            <div class="gpu-card">
-              <div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> ${name}</div>
-              <strong style="color:${loadColor};font-size:1.55rem;">${memPct}<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>
-              <div class="gpu-metrics">
-                <div class="gpu-metric"><span class="gpu-label">Compute:</span>${proc}%</div>
-                <div class="gpu-metric"><span class="gpu-label">Temp:</span>${temp}</div>
-                <div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>${fan}</div>
-              </div>
-            </div>`;
-        }
+        html += `
+          <div class="gpu-card">
+            <div class="gpu-header"><span class="gpu-icon">&#x1F4A1;</span> ${name}</div>
+            <strong style="color:${loadColor};font-size:1.55rem;">${memPct}<span style="font-size:.85rem;color:#565f89;margin-left:.2rem">%</span></strong><span class="desc" style="color:#565f89;margin-left:.3rem;font-size:.78rem;">VRAM</span>
+            <div class="gpu-metrics">
+              <div class="gpu-metric"><span class="gpu-label">Compute:</span>${proc}%</div>
+              <div class="gpu-metric"><span class="gpu-label">Temp:</span>${temp}</div>
+              <div class="gpu-metric" style="grid-column: span 2;"><span class="gpu-label">Fan:</span>${fan}</div>
+            </div>
+          </div>`;
       }
       container.innerHTML = html;
     })
     .catch(() => {
-      if (!container.querySelector('h3')) {
-        container.innerHTML = '<span style="color:#ff6e6a;font-size:.85rem;">GPU stats unavailable</span>';
-      }
+      container.innerHTML = '<span class="gpu-note">GPU stats unavailable</span>';
     });
 }
 
+// ─────────────────────────── speed test ───────────────────────────
+// Measures this browser's link to the dashboard host, which is the number that
+// actually matters for a LAN dashboard. The payload is generated by the CLI.
+function note(text) {
+  const el = document.getElementById('toolbar-note');
+  if (el) el.textContent = text || '';
+}
+
+async function runSpeedTest() {
+  const cfg = (SYSPLASH && SYSPLASH.speedtest) || {};
+  const btn = document.getElementById('speedtest');
+  const chip = document.getElementById('speed-chip');
+  if (!cfg.bytes || !cfg.file) return;
+
+  btn.disabled = true;
+  note('measuring…');
+  let best = 0;
+  try {
+    // Several passes, keeping the best: a single run is dominated by whatever else
+    // the machine happened to be doing.
+    for (let pass = 0; pass < 3; pass++) {
+      const url = cfg.file + '?cb=' + Date.now() + '-' + pass;
+      const started = performance.now();
+      const resp = await fetch(url, { cache: 'no-store' });
+      // The fetch promise resolves on headers, so the body must be consumed or the
+      // measurement is of latency rather than throughput.
+      await resp.arrayBuffer();
+      const seconds = (performance.now() - started) / 1000;
+      const mbps = (cfg.bytes * 8) / seconds / 1e6;
+      if (mbps > best) best = mbps;
+    }
+  } catch (e) {
+    note('speed test failed: ' + e.message);
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  note('');
+  chip.hidden = false;
+  chip.textContent = (best >= 100 ? best.toFixed(0) : best.toFixed(1)) + ' Mb/s';
+}
+
+// ─────────────────────────── resync ───────────────────────────
+// A browser cannot enumerate a remote host's listening sockets, so this probes the
+// candidate ports written into the page. It finds services started since the page was
+// generated; it cannot find one listening on a port nobody listed.
+function catalogFor(port) {
+  const entries = (SYSPLASH && SYSPLASH.catalog) || [];
+  return entries.find(e => e.port === port) || null;
+}
+
+function svgFallbackIcon() { return '\u{1F50C}'; }
+
+function buildCard(port) {
+  const entry = catalogFor(port);
+  const protocol = (entry && entry.protocol) || 'http';
+  const name = (entry && entry.name) || ('Service on :' + port);
+  const desc = (entry && entry.desc) || 'Discovered by resync';
+  const group = (entry && entry.group) || 'Host Services';
+  const icon = (entry && entry.icon) || svgFallbackIcon();
+  const host = SYSPLASH.host;
+  const scheme = protocol === 'https' ? 'https' : 'http';
+  const href = scheme + '://' + host + ':' + port;
+  const probe = (protocol === 'http' || protocol === 'https') ? href : null;
+
+  const el = document.createElement(probe ? 'a' : 'div');
+  el.className = 'card status-unknown' + (probe ? '' : ' no-link');
+  if (probe) {
+    el.href = href;
+    el.dataset.probe = probe;
+  }
+  el.dataset.service = name;
+  el.dataset.resynced = '1';
+  el.innerHTML =
+    '<span class="status-icon" aria-hidden="true">\u25CF</span>' +
+    (icon.indexOf('/') !== -1
+      ? '<span class="icon"><img class="icon-img" src="' + icon + '" alt=""></span>'
+      : '<span class="icon">' + icon + '</span>') +
+    '<div class="info"><span class="name"></span><br><span class="desc"></span></div>' +
+    '<div class="link-wrap"><span class="protocol">' + protocol + ':</span><span class="link">:' + port + '</span></div>';
+  el.querySelector('.name').textContent = name;
+  el.querySelector('.desc').textContent = desc;
+  return { el, group, probe };
+}
+
+function gridFor(group) {
+  const headings = Array.from(document.querySelectorAll('h2'));
+  const wanted = headings.find(h => h.textContent.trim().toLowerCase().endsWith(group.toLowerCase()));
+  if (wanted && wanted.nextElementSibling && wanted.nextElementSibling.classList.contains('grid')) {
+    return wanted.nextElementSibling;
+  }
+  const heading = document.createElement('h2');
+  heading.textContent = group;
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  const anchor = document.querySelector('footer');
+  anchor.parentNode.insertBefore(heading, anchor);
+  anchor.parentNode.insertBefore(grid, anchor);
+  return grid;
+}
+
+async function probePort(port) {
+  const host = SYSPLASH.host;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    await fetch('http://' + host + ':' + port + '/', {
+      mode: 'no-cors', cache: 'no-store', signal: controller.signal,
+    });
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resync() {
+  if (!SYSPLASH || !SYSPLASH.host) { note('resync unavailable'); return; }
+  const btn = document.getElementById('resync');
+  btn.disabled = true;
+
+  refreshStatus();
+
+  const known = new Set(SYSPLASH.knownPorts || []);
+  document.querySelectorAll('.card[data-service]').forEach(card => {
+    const link = card.querySelector('.link');
+    if (link) {
+      const m = link.textContent.match(/(\d+)/);
+      if (m) known.add(parseInt(m[1], 10));
+    }
+  });
+
+  const todo = (SYSPLASH.candidates || []).filter(p => !known.has(p));
+  note('probing ' + todo.length + ' ports…');
+
+  // A handful of workers: enough to be quick, few enough not to swamp the host.
+  const found = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const port = todo[next++];
+      if (await probePort(port)) found.push(port);
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+
+  found.sort((a, b) => a - b);
+  let added = 0;
+  for (const port of found) {
+    const { el, group, probe } = buildCard(port);
+    gridFor(group).appendChild(el);
+    if (probe) probeCard(el); else setStatus(el, 'unknown');
+    added++;
+  }
+
+  btn.disabled = false;
+  note(added === 0
+    ? 'no new services found in ' + todo.length + ' candidate ports'
+    : 'added ' + added + ' new service' + (added === 1 ? '' : 's'));
+}
+
+document.getElementById('speedtest').addEventListener('click', runSpeedTest);
+document.getElementById('resync').addEventListener('click', resync);
+document.getElementById('refresh').addEventListener('click', refreshStatus);
+refreshStatus();
 renderGPUs();
 setInterval(renderGPUs, 3000);
-
-// ── OpenService: click any card with http probe → open that URL in new tab ──
-function openService(el) {
-  var link = el.querySelector('.link');
-  if (!link) return;
-  var url = link.getAttribute('href') || '';
-  window.location.href = url;
-}
-
-// ── Logs Modal ──
-function fetchLogs(serviceName) {
-  const overlay = document.getElementById('logs-modal-overlay');
-  const titleEl = document.getElementById('modal-service');
-  const bodyEl = document.getElementById('modal-body');
-
-  titleEl.textContent = serviceName + ' logs';
-  bodyEl.innerHTML = '<span style="color:#7aa2f7;">Fetching...<\/span>';
-  overlay.classList.add('open');
-
-  fetch('/api/logs?service=' + encodeURIComponent(serviceName))
-    .then(r => r.json())
-    .then(data => {
-      if (data.error || !data.logs) {
-        bodyEl.innerHTML = '<span style="color:#ff6e6a;">' + (data.error || 'No logs available') + '<\/span>';
-        return;
-      }
-      const lines = typeof data.logs === 'string' ? data.logs.split('\n') :
-        Array.isArray(data.logs) ? data.logs.toString().split('\n') : [String(data.logs)];
-      const shown = lines.slice(0, 150);
-      bodyEl.textContent = shown.join('\n') + (lines.length > 150 ? '\n\n... more' : '');
-    })
-    .catch(e => {
-      bodyEl.innerHTML = '<span style="color:#ff6e6a;">Failed to fetch: ' + e.message + '<\/span>';
-    });
-}
-
-function closeModal() {
-  document.getElementById('logs-modal-overlay').classList.remove('open');
-}
+setInterval(refreshStatus, 30000);
 </script>
-<footer><!-- FOOTER --></footer>
 </body>
 </html>

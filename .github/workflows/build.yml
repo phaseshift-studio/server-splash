@@ -1,0 +1,110 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The suite needs no Docker, systemd or GPU: the parsers are pure functions over
+      # captured command output.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke test the binary
+        run: |
+          ./target/release/splash --version
+          ./target/release/splash --help > /dev/null
+          ./target/release/splash --auto --no-agent --output /tmp/smoke
+          test -f /tmp/smoke/index.html
+          grep -q "powered by server-splash" /tmp/smoke/index.html
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: splash-linux-x86_64
+          path: target/release/splash
+          if-no-files-found: error
+
+  docker:
+    name: build and publish the image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Pull requests build the image but must never publish it.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # `load` keeps a usable local image so the smoke test below runs against the
+          # exact artefact being published, not a rebuild of it.
+          load: true
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        # Runs it the way a user would, then lets the binary answer for itself.
+        run: |
+          TAG="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -1)"
+          echo "testing $TAG"
+          docker run -d --name smoke --network host --pid host \
+            -e SPLASH_PORT=18080 -e SPLASH_INTERVAL=0 -e SPLASH_NO_AGENT=true \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            "$TAG"
+          sleep 20
+          docker exec smoke /usr/local/bin/splash --healthcheck --port 18080
+          docker exec smoke cat /data/index.html | grep -q "powered by server-splash"
+          docker logs smoke
+          docker rm -f smoke

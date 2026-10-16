@@ -26,6 +26,71 @@ pub(crate) struct SplashService {
     pub group: String,
     #[serde(default)]
     pub web_probe_url: Option<String>,
+    /// Stable identity used by `overrides.toml` curation, e.g. `port:11434` or
+    /// `docker:zigbee2mqtt`. Unlike the display name this never changes.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Where this entry was found: `docker`, `systemd`, `port`, `agent`, `config`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The port is bound to loopback only, so the card must not offer a remote link.
+    #[serde(default)]
+    pub local_only: bool,
+    /// Reachability measured at generation time. Deliberately not persisted — it is
+    /// re-measured on every run and refreshed live in the browser.
+    #[serde(skip)]
+    pub alive: bool,
+    /// Kept in `splash-state.json` / curation but left off the generated page.
+    #[serde(default)]
+    pub hidden: bool,
+    /// True when the icon is a deliberate choice (curation, a known service, or the
+    /// service's own favicon) rather than the generic per-protocol fallback. The LLM
+    /// enrichment pass may only overwrite icons that are *not* specific.
+    #[serde(skip)]
+    pub icon_specific: bool,
+    /// True when the name came from curation, a recognised service, or the service's
+    /// own page title — i.e. the project's own spelling of its name. Enrichment must
+    /// not second-guess it (a model that "corrects" `metatron` to `Metatron` is
+    /// wrong, and so is one that renames every container `Docker`).
+    #[serde(skip)]
+    pub name_specific: bool,
+    /// True when the description came from a catalog rule rather than a fallback.
+    #[serde(skip)]
+    pub desc_specific: bool,
+    /// Raw bytes of the service's own icon, written to `icons/` at generate time.
+    #[serde(skip)]
+    pub icon_data: Option<Vec<u8>>,
+}
+
+impl SplashService {
+    /// A blank entry with all defaults filled in — used by `Default`-style builders.
+    pub(crate) fn blank() -> Self {
+        SplashService {
+            name: String::new(),
+            desc: String::new(),
+            icon: "🔌".to_string(),
+            protocol: "http".to_string(),
+            port: None,
+            host_override: None,
+            base_path: None,
+            group: "Host Services".to_string(),
+            web_probe_url: None,
+            id: None,
+            source: None,
+            local_only: false,
+            alive: false,
+            hidden: false,
+            icon_specific: false,
+            name_specific: false,
+            desc_specific: false,
+            icon_data: None,
+        }
+    }
+
+    /// Numeric port, if the entry has one.
+    pub(crate) fn port_num(&self) -> Option<u16> {
+        self.port.as_deref().and_then(|p| p.trim().parse::<u16>().ok())
+    }
 }
 
 /// A GUI addon pairing (e.g., Ollama -> Ollama Dashboard).
@@ -142,12 +207,34 @@ struct SplashState {
 /// Wizard state produced after user answers all prompts.
 pub(crate) struct WizardOutput {
     pub output_dir: PathBuf,
+    /// Filename written inside `output_dir`, e.g. `index.html`.
+    pub output_file: String,
     pub hostname: String,
+    /// `<h1>` and `<title>` text. Defaults to the hostname.
+    pub title: String,
+    /// Subtitle line under the title, e.g. `Dual RTX 3090 — Linux Mint 22.3 — services directory`.
+    pub subtitle: String,
+    /// Address shown in the footer.
+    pub ip_display: String,
     pub selected_services: Vec<SplashService>,
     pub _probe_results: Vec<ProbeResult>,
     pub selected_modules: Vec<String>,
     pub glances_api_base: Option<String>,
     pub deploy_path: Option<String>,
+    /// Pre-rendered cards for generated sub-dashboards, spliced into the page.
+    pub extra_cards: Vec<String>,
+    /// GPUs read from `nvidia-smi` at generation time. Rendered into the page so the
+    /// stats are there on first paint, with Glances refreshing them live.
+    pub gpus: Vec<crate::discover::Gpu>,
+    /// Short facts shown under the title: `64 GB RAM`, `4.0 TB across 3 disks`, …
+    pub sys_chips: Vec<String>,
+    /// Size of the downloadable payload used by the in-page speed test. 0 disables it.
+    pub speedtest_bytes: u64,
+    /// Where curation rules live, so the page can embed the same port catalog the
+    /// generator used.
+    pub overrides_path: PathBuf,
+    /// Embed icons in the page as data URIs instead of writing `icons/` files.
+    pub inline_icons: bool,
 }
 
 /// Wrap text into lines of given width. Returns wrapped lines.
@@ -271,12 +358,38 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
     let has_tty = atty::is(Stream::Stdin);
 
     // 1. Determine hostname
-    let hostname = config.hostname.clone()
-        .or_else(get_hostname)
-        .unwrap_or_else(|| "localhost".to_string());
+    let machine = crate::discover::collect_machine();
+    let hostname = crate::discover::qualify_host(
+        config.hostname.clone()
+            .or_else(get_hostname)
+            .unwrap_or_else(|| "localhost".to_string())
+            .as_str(),
+        &config.host_suffix(),
+    );
     eprintln!("{}: {}", bold_cyan("Hostname"), cyan(&hostname));
 
-    // 2. Choose agent endpoint and model
+    // 2. Decide where the candidate list comes from. The agent is an optional
+    //    nicety — deterministic discovery finds the same services without an LLM,
+    //    which is what makes the tool usable on a machine with no Ollama running.
+    if !config.agent_enabled() {
+        eprintln!(
+            "\n{}: agent disabled — using deterministic discovery",
+            bold_yellow("Note")
+        );
+        return finish_from_discovery(config, hostname, has_tty);
+    }
+    let agent_available = crate::agent::is_openai_compatible(&config.agent_url);
+    if !agent_available && !has_tty {
+        // Non-interactive and no agent: never block on a prompt.
+        eprintln!(
+            "\n{}: no agent at {} — using deterministic discovery",
+            bold_yellow("Note"),
+            cyan(&config.agent_url)
+        );
+        return finish_from_discovery(config, hostname, has_tty);
+    }
+
+    // 3. Choose agent endpoint and model
     let base_url = ask_agent_endpoint(&config.agent_url)?;
 
     // Verify the endpoint is reachable before proceeding
@@ -390,12 +503,22 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
 
             return Ok(WizardOutput {
                 output_dir: PathBuf::from(user_input_dir),
+                output_file: config.get_output_file(),
                 hostname: state.hostname.clone(),
+                title: config.get_title(&state.hostname),
+                subtitle: config.get_subtitle(),
+                ip_display: machine.ip.clone(),
                 selected_services: services,
                 _probe_results: probe_results,
                 selected_modules: state.selected_modules,
                 glances_api_base: state.glances_api_base,
                 deploy_path: None,
+                extra_cards: Vec::new(),
+                gpus: machine.gpus.clone(),
+                sys_chips: machine.stat_chips(),
+                speedtest_bytes: config.speedtest_bytes(),
+                overrides_path: config.get_overrides_path(),
+                inline_icons: config.inline_icons(),
             });
         }
     }
@@ -527,7 +650,7 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
                 ))?;
 
             if content.trim().is_empty() {
-                return Err(anyhow::anyhow!("Agent returned empty message content.\nFull response:\n{}", &body));
+                return Err(anyhow::anyhow!("Agent returned empty message content.\nFull response:\n{}", body));
             }
 
             content.to_string()
@@ -569,11 +692,70 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
     eprintln!("\n{}: {}", bold_yellow("Found"), green(&format!("{} potential service(s)", all_services.len())));
 
     // All services selected by default; deselection happens in the probe table via 's' key
-    let mut selected: Vec<SplashService> = all_services;
+    let selected: Vec<SplashService> = all_services;
 
     eprintln!("\n{}: {} (toggle in probe table with 's' key)",
         bold_green("All services selected"), red(&format!("{} service(s)", selected.len())));
 
+
+    curate_and_finish(config, hostname, has_tty, base_url, selected)
+}
+
+/// Build the candidate list from the host itself, then run the shared tail.
+fn finish_from_discovery(
+    config: &crate::config::SplashConfig,
+    hostname: String,
+    has_tty: bool,
+) -> anyhow::Result<WizardOutput> {
+    let selected = services_from_discovery(config, &hostname);
+    if selected.is_empty() {
+        anyhow::bail!(bold_red(
+            "Nothing discovered: no listening services found, and no agent is available to look further."
+        ));
+    }
+    eprintln!(
+        "\n{}: {}",
+        bold_yellow("Found"),
+        green(&format!("{} potential service(s)", selected.len()))
+    );
+    curate_and_finish(config, hostname, has_tty, config.agent_url.clone(), selected)
+}
+
+/// Deterministic discovery resolved through the catalog. Shared with `splash --auto`
+/// so both entry points agree on what is running.
+fn services_from_discovery(
+    config: &crate::config::SplashConfig,
+    hostname: &str,
+) -> Vec<SplashService> {
+    let opts = crate::discover::Options {
+        include_loopback: config.include_loopback(),
+        exclude_ports: config.excluded_ports(),
+        include_ephemeral: config.include_ephemeral(),
+        probe_http: config.probe_http(),
+        http_timeout: std::time::Duration::from_millis(config.http_timeout_ms()),
+        ..crate::discover::Options::default()
+    };
+    let discovery = crate::discover::run(&opts);
+    let catalog = crate::catalog::Catalog::load(&config.get_overrides_path());
+    discovery
+        .services
+        .iter()
+        .filter_map(|s| catalog.resolve(s, hostname, true))
+        .collect()
+}
+
+/// The part of the wizard that is identical whether the candidate list came from
+/// the agent or from deterministic discovery: GUI add-ons, sub-dashboard modules,
+/// the interactive probe table, persistence and deployment.
+fn curate_and_finish(
+    config: &crate::config::SplashConfig,
+    hostname: String,
+    has_tty: bool,
+    base_url: String,
+    mut selected: Vec<SplashService>,
+) -> anyhow::Result<WizardOutput> {
+    let user_input_dir = config.get_output_dir("./server-splash");
+    let machine = crate::discover::collect_machine();
     // 6. Gather and display known GUI pairings
     let gui_file = config.gui_pairs_file.as_deref()
         .map(PathBuf::from)
@@ -655,17 +837,6 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
         if picked.is_empty() {
             for m in &available_modules {
                 selected_module_names.push(m.name.clone());
-                selected.push(SplashService {
-                    name: m.name.clone(),
-                    desc: m.description.clone(),
-                    icon: m.icon.clone(),
-                    protocol: "http".to_string(),
-                    port: Some(m.default_port.to_string()),
-                    host_override: None,
-                    base_path: Some(format!("/{}", m.url_prefix.trim_start_matches('/'))),
-                    group: "Dashboard Modules".to_string(),
-                    web_probe_url: None,
-                });
             }
         } else {
             let mut indices: Vec<usize> = Vec::new();
@@ -688,17 +859,6 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
             for &idx in &indices {
                 if let Some(m) = available_modules.get(idx) {
                     selected_module_names.push(m.name.clone());
-                    selected.push(SplashService {
-                        name: m.name.clone(),
-                        desc: m.description.clone(),
-                        icon: m.icon.clone(),
-                        protocol: "http".to_string(),
-                        port: Some(m.default_port.to_string()),
-                        host_override: None,
-                        base_path: Some(format!("/{}", m.url_prefix.trim_start_matches('/'))),
-                        group: "Dashboard Modules".to_string(),
-                        web_probe_url: None,
-                    });
                 }
             }
         }
@@ -733,6 +893,9 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
         output_dir: Some(user_input_dir.clone()),
         gui_pairs_file: Some(gui_file.to_string_lossy().into_owned()),
         glances_api_base: config.glances_api_base.clone(),
+        // Everything else (title, output_file, deploy_path, curation path, …) is
+        // carried through untouched so a wizard run never silently drops settings.
+        ..config.clone()
     };
     cfg_persist.save_config();
 
@@ -818,12 +981,22 @@ Return ONLY valid JSON. No markdown fences, no explanation."#;
 
     Ok(WizardOutput {
         output_dir: PathBuf::from(user_input_dir),
-        hostname,
+        output_file: config.get_output_file(),
+        hostname: hostname.clone(),
+        title: config.get_title(&hostname),
+        subtitle: config.get_subtitle(),
+        ip_display: machine.ip.clone(),
         selected_services: selected,
         _probe_results: probe_results,
         selected_modules: selected_module_names,
         glances_api_base,
         deploy_path,
+        extra_cards: Vec::new(),
+        gpus: machine.gpus.clone(),
+        sys_chips: machine.stat_chips(),
+        speedtest_bytes: config.speedtest_bytes(),
+        overrides_path: config.get_overrides_path(),
+        inline_icons: config.inline_icons(),
     })
 }
 
@@ -990,7 +1163,11 @@ fn display_probe_table(results: &[ProbeResult], highlight: Option<(usize, u8)>) 
 
     for (i, r) in results.iter().enumerate() {
         let inc = if r.selected { " \u{2714} " } else { "   " };
-        let status = if r.alive {
+        let status = if r.endpoint == "n/a" {
+            // Nothing to probe: saying "down" would be a false alarm and "alive" an
+            // unverified claim. The page itself shows these as status-unknown.
+            cell_r(&yellow("n/a"), w_status)
+        } else if r.alive {
             cell_r(&bold_green("alive"), w_status)
         } else {
             cell_r(&bold_red("down"), w_status)
@@ -1195,7 +1372,12 @@ fn probe_and_display_services(
         let url = build_probe_url(svc, hostname);
         let endpoint = url.clone().unwrap_or_else(|| "n/a".to_string());
 
-        let alive = if let Some(u) = url.as_ref() {
+        // Discovery already probed this one over loopback, which is more reliable
+        // than dialling the display hostname (that may not resolve on the host
+        // itself). Only probe the ones that arrive unclassified, e.g. from the agent.
+        let alive = if svc.alive {
+            true
+        } else if let Some(u) = url.as_ref() {
             eprint!(".");
             std::io::stdout().flush().ok();
             probe_http(u)
@@ -1476,30 +1658,53 @@ fn parse_agent_json(text: &str) -> anyhow::Result<Vec<SplashService>> {
     ))
 }
 
+/// Read a JSON value that may legitimately be a string *or* a number.
+///
+/// Local LLMs routinely answer `"port": 8080` where the prompt asked for `"8080"`.
+/// The original code called `as_str()` and silently discarded the port, which turned
+/// a perfectly good web service into a "daemon only" card. Accept both.
+fn json_str_any(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("null") { None } else { Some(t.to_string()) }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 fn parse_services_from_arr(arr: &[serde_json::Value]) -> anyhow::Result<Vec<SplashService>> {
-    Ok(arr.iter().map(|v| SplashService {
-        name: v["name"].as_str().unwrap_or("").to_string(),
-        desc: v["desc"].as_str().unwrap_or("").to_string(),
-        icon: v["icon"].as_str().unwrap_or("🛠️").to_string(),
-        protocol: v.get("protocol")
-            .or_else(|| v.get("proto"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_default(),
-        port: v.get("port").and_then(|v| v.as_str()).map(String::from),
-        host_override: v.get("host_override") // handle both underscores and hyphens
-            .or_else(|| v.get("host-override"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        base_path: v.get("base_path") // handle both underscores and hyphens
-            .or_else(|| v.get("basePath"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        group: v["group"].as_str().unwrap_or("Host Services").to_string(),
-        web_probe_url: v.get("web_probe_url") // handle both underscores and hyphens
-            .or_else(|| v.get("web-probe-url"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
+    Ok(arr.iter().map(|v| {
+        let get = |k: &str| v.get(k);
+        SplashService {
+            name: json_str_any(get("name")).unwrap_or_default(),
+            desc: json_str_any(get("desc")).unwrap_or_default(),
+            icon: json_str_any(get("icon")).unwrap_or_else(|| "🛠️".to_string()),
+            protocol: json_str_any(get("protocol").or_else(|| get("proto")))
+                .unwrap_or_default()
+                .to_lowercase(),
+            port: json_str_any(get("port")),
+            host_override: json_str_any(
+                get("host_override").or_else(|| get("host-override")),
+            ),
+            base_path: json_str_any(get("base_path").or_else(|| get("basePath"))),
+            group: json_str_any(get("group")).unwrap_or_else(|| "Host Services".to_string()),
+            web_probe_url: json_str_any(
+                get("web_probe_url").or_else(|| get("web-probe-url")),
+            ),
+            id: json_str_any(get("id")),
+            source: json_str_any(get("source")).or_else(|| Some("agent".to_string())),
+            local_only: v.get("local_only").and_then(|x| x.as_bool()).unwrap_or(false),
+            alive: false,
+            hidden: v.get("hidden").and_then(|x| x.as_bool()).unwrap_or(false),
+            // An agent-supplied icon is a guess, so it stays overwritable by anything
+            // better (a favicon, or the built-in catalog).
+            icon_specific: false,
+            name_specific: false,
+            desc_specific: false,
+            icon_data: None,
+        }
     }).collect())
 }
 
@@ -1559,9 +1764,9 @@ fn create_gui_service(addon: &GuiAddon, hostname: &str) -> SplashService {
         icon: addon.icon.clone(),
         protocol: "http".to_string(),
         port: Some(addon.src_port.to_string()),
-        host_override: None,
         base_path: Some("/".to_string()),
-        group: "".to_string(),
-        web_probe_url: None,
+        id: Some(format!("port:{}", addon.src_port)),
+        source: Some("config".to_string()),
+        ..SplashService::blank()
     }
 }

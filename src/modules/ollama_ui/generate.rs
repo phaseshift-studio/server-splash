@@ -19,7 +19,7 @@ fn esc(s: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) fn generate(
     output_dir: &Path,
     hostname: &str,
-    port: u16,
+    _port: u16,
     service_port: u16,
     glances_port: Option<u16>,
 ) -> Result<String, String> {

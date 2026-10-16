@@ -1,0 +1,23 @@
+# Keep the build context to the things the image actually compiles.
+target
+.git
+.github
+backups
+deploy
+scripts
+server-splash
+
+# Docs and dev-only files.
+*.md
+LICENSE
+screenshot.png
+screenshots
+.dockerignore
+docker-compose.yml
+
+# Generator artefacts.
+dashboard.json
+splash-state.json
+agent-response.json
+splash-meta.json
+speedtest.bin
