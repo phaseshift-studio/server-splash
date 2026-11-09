@@ -47,6 +47,52 @@ pub(crate) struct NetIface {
     pub physical: bool,
 }
 
+/// Smoothed load averages from `/proc/loadavg`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LoadAverage {
+    pub one: f32,
+    pub five: f32,
+    pub fifteen: f32,
+}
+
+/// Memory usage from `/proc/meminfo`, in mebibytes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MemInfo {
+    pub total_mb: u64,
+    /// `MemTotal - MemAvailable`: what system monitors call "used", counting
+    /// reclaimable page cache as free rather than as a leak.
+    pub used_mb: u64,
+    pub available_mb: u64,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
+}
+
+/// Machine load sampled at generation time, for the panel beside the GPU cards.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SystemStats {
+    pub load: Option<LoadAverage>,
+    /// Busy CPU percentage over a short sample, not an average since boot.
+    pub cpu_pct: Option<u32>,
+    pub mem: Option<MemInfo>,
+    /// Logical cores. Load is only meaningful per core, so the cards qualify it.
+    pub cpu_count: usize,
+}
+
+impl SystemStats {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.load.is_none() && self.cpu_pct.is_none() && self.mem.is_none()
+    }
+
+    /// Memory in use as a percentage, for the big number on the card.
+    pub(crate) fn mem_pct(&self) -> Option<u32> {
+        let mem = self.mem?;
+        if mem.total_mb == 0 {
+            return None;
+        }
+        Some(((mem.used_mb as f64 / mem.total_mb as f64) * 100.0).round().clamp(0.0, 100.0) as u32)
+    }
+}
+
 /// Static facts about the machine, used for the page subtitle.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Machine {
@@ -60,6 +106,8 @@ pub(crate) struct Machine {
     pub gpus: Vec<Gpu>,
     pub disks: Vec<Disk>,
     pub net: Vec<NetIface>,
+    /// Load, CPU and memory sampled at generation time.
+    pub system: SystemStats,
 }
 
 impl Machine {
@@ -826,6 +874,130 @@ pub(crate) fn sniff_image_ext(bytes: &[u8], content_type: &str) -> Option<String
     Some(ext.to_string())
 }
 
+// ───────────────────────────── system load ─────────────────────────────
+
+/// Sample `/proc` for load, memory and CPU. A missing file (or a non-Linux host)
+/// simply leaves that field absent, so the panel degrades instead of lying.
+pub(crate) fn collect_system_stats() -> SystemStats {
+    SystemStats {
+        load: std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .as_deref()
+            .and_then(parse_loadavg),
+        cpu_pct: sample_cpu_usage(),
+        mem: std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_meminfo),
+        cpu_count: 0,
+    }
+}
+
+/// Measure CPU busy percentage over a short window.
+///
+/// `/proc/stat` is a counter since boot, so one read gives an average over the
+/// machine's whole uptime — a number that barely moves and hides a busy moment. Two
+/// reads a moment apart measure what the machine is doing now, which is the whole
+/// point of the card.
+fn sample_cpu_usage() -> Option<u32> {
+    // Long enough to average out the sampling instant, short enough to be free in a
+    // regeneration loop that runs every 15 minutes.
+    const SAMPLE: Duration = Duration::from_millis(150);
+    let first = parse_cpu_times(&std::fs::read_to_string("/proc/stat").ok()?)?;
+    std::thread::sleep(SAMPLE);
+    let second = parse_cpu_times(&std::fs::read_to_string("/proc/stat").ok()?)?;
+    cpu_usage_pct(&first, &second)
+}
+
+/// Aggregate CPU counters from the `cpu` line of `/proc/stat`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CpuTimes {
+    /// `idle + iowait` — time the CPU had nothing to run.
+    idle: u64,
+    /// Every counter except `guest`/`guest_nice`, which the kernel already includes in
+    /// `user`/`nice` and would otherwise be counted twice.
+    total: u64,
+}
+
+/// Parse the aggregate `cpu` line (not `cpu0`, `cpu1`, …).
+pub(crate) fn parse_cpu_times(stat: &str) -> Option<CpuTimes> {
+    let line = stat.lines().find(|l| l.starts_with("cpu "))?;
+    // `guest`/`guest_nice` are already included in `user`/`nice`, so take only the
+    // first eight counters. Any malformed field rejects the whole line rather than
+    // shifting the idle column.
+    let fields: Option<Vec<u64>> = line
+        .split_whitespace()
+        .skip(1)
+        .take(8)
+        .map(|f| f.parse::<u64>().ok())
+        .collect();
+    let fields = fields?;
+    if fields.len() < 4 {
+        return None;
+    }
+    let total = fields.iter().sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Some(CpuTimes { idle, total })
+}
+
+/// Busy CPU ticks out of total ticks between two samples, as a percentage.
+pub(crate) fn cpu_usage_pct(first: &CpuTimes, second: &CpuTimes) -> Option<u32> {
+    let total = second.total.checked_sub(first.total)?;
+    let idle = second.idle.checked_sub(first.idle)?;
+    if total == 0 {
+        return None;
+    }
+    let busy = total.saturating_sub(idle);
+    Some(((busy as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u32)
+}
+
+/// `2.83 2.66 2.46 2/3621 334586` -> the three load averages.
+pub(crate) fn parse_loadavg(text: &str) -> Option<LoadAverage> {
+    let mut fields = text.split_whitespace();
+    let one: f32 = fields.next()?.parse().ok()?;
+    let five: f32 = fields.next()?.parse().ok()?;
+    let fifteen: f32 = fields.next()?.parse().ok()?;
+    Some(LoadAverage { one, five, fifteen })
+}
+
+/// Parse `/proc/meminfo` into mebibytes.
+///
+/// `MemAvailable` is what the kernel offers a new workload and is the right basis for
+/// "used": it excludes reclaimable cache, so a machine that has been up for a month
+/// does not look full. Older kernels (before 3.14) lack it, so fall back to the
+/// free + buffers + cached sum that the field replaced.
+pub(crate) fn parse_meminfo(text: &str) -> Option<MemInfo> {
+    let mut values: BTreeMap<&str, u64> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else { continue };
+        let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        values.insert(key.trim(), kb / 1024);
+    }
+
+    let total_mb = *values.get("MemTotal")?;
+    if total_mb == 0 {
+        return None;
+    }
+    let available_mb = values.get("MemAvailable").copied().unwrap_or_else(|| {
+        values.get("MemFree").copied().unwrap_or(0)
+            + values.get("Buffers").copied().unwrap_or(0)
+            + values.get("Cached").copied().unwrap_or(0)
+    });
+
+    let swap_total_mb = values.get("SwapTotal").copied().unwrap_or(0);
+    let swap_free_mb = values.get("SwapFree").copied().unwrap_or(swap_total_mb);
+
+    Some(MemInfo {
+        total_mb,
+        used_mb: total_mb.saturating_sub(available_mb),
+        available_mb,
+        swap_total_mb,
+        swap_used_mb: swap_total_mb.saturating_sub(swap_free_mb),
+    })
+}
+
 // ───────────────────────────── top level ─────────────────────────────
 
 pub(crate) fn collect_machine() -> Machine {
@@ -847,19 +1019,12 @@ pub(crate) fn collect_machine() -> Machine {
 
     let kernel = run_cmd("uname", &["-r"]).map(|s| s.trim().to_string()).unwrap_or_default();
 
-    let mem_mb = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|c| {
-            c.lines().find_map(|l| {
-                l.strip_prefix("MemTotal:")
-                    .and_then(|v| v.split_whitespace().next())
-                    .and_then(|kb| kb.parse::<u64>().ok())
-                    .map(|kb| kb / 1024)
-            })
-        })
-        .unwrap_or(0);
+    let mut system = collect_system_stats();
+    // The chips show total RAM; reuse the sample rather than reading /proc twice.
+    let mem_mb = system.mem.map(|m| m.total_mb).unwrap_or(0);
 
     let cpu_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    system.cpu_count = cpu_count;
 
     // `hostname -I` lists every address; the first is the primary one. Falling back to
     // the wildcard is better than showing nothing, and the footer treats "*" as unknown.
@@ -883,7 +1048,7 @@ pub(crate) fn collect_machine() -> Machine {
 
     let net = collect_net();
 
-    Machine { hostname, ip, distro, kernel, mem_mb, cpu_count, gpus, disks, net }
+    Machine { hostname, ip, distro, kernel, mem_mb, cpu_count, gpus, disks, net, system }
 }
 
 /// `PRETTY_NAME="Linux Mint 22.3"` -> `Linux Mint 22.3`
@@ -1141,6 +1306,81 @@ not-a-unit line here
         assert_eq!(gpus[1].util_pct, Some(12));
         assert_eq!(gpus[2].mem_pct, 0, "zero total must not divide by zero");
         assert_eq!(gpus[2].fan_pct, None, "N/A is not a number");
+    }
+
+    #[test]
+    fn parses_memory_usage_as_used_of_total() {
+        let sample = "\
+MemTotal:       16384000 kB
+MemFree:         2000000 kB
+MemAvailable:    8192000 kB
+Buffers:          100000 kB
+Cached:          3000000 kB
+SwapTotal:       8192000 kB
+SwapFree:        6144000 kB
+";
+        let mem = parse_meminfo(sample).expect("meminfo parses");
+        assert_eq!(mem.total_mb, 16000);
+        assert_eq!(mem.available_mb, 8000);
+        assert_eq!(mem.used_mb, 8000, "used is total minus what a workload could claim");
+        assert_eq!(mem.swap_total_mb, 8000);
+        assert_eq!(mem.swap_used_mb, 2000);
+
+        let stats = SystemStats { mem: Some(mem), ..SystemStats::default() };
+        assert_eq!(stats.mem_pct(), Some(50));
+    }
+
+    #[test]
+    fn memory_falls_back_when_mem_available_is_absent() {
+        // Kernels before 3.14: free + buffers + cached is the old definition of
+        // "available", and without the fallback the card would claim all RAM is used.
+        let sample = "\
+MemTotal:        8192000 kB
+MemFree:         1024000 kB
+Buffers:          102400 kB
+Cached:          2048000 kB
+";
+        let mem = parse_meminfo(sample).unwrap();
+        assert_eq!(mem.total_mb, 8000);
+        assert_eq!(mem.available_mb, 3100);
+        assert_eq!(mem.used_mb, 4900);
+        assert_eq!(mem.swap_total_mb, 0);
+
+        assert!(parse_meminfo("").is_none(), "a file with no MemTotal is not usable");
+    }
+
+    #[test]
+    fn parses_load_averages() {
+        let load = parse_loadavg("2.83 2.66 2.46 2/3621 334586").expect("loadavg parses");
+        assert_eq!(load.one, 2.83);
+        assert_eq!(load.five, 2.66);
+        assert_eq!(load.fifteen, 2.46);
+
+        assert!(parse_loadavg("").is_none());
+        assert!(parse_loadavg("not a load average").is_none());
+        assert!(parse_loadavg("1.00 0.50").is_none(), "all three windows are required");
+    }
+
+    #[test]
+    fn cpu_usage_is_a_delta_not_an_average_since_boot() {
+        let first = parse_cpu_times(
+            "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 1 2 3 4 5 6 7 8\n",
+        )
+        .expect("aggregate cpu line parses");
+
+        // 300 new ticks, of which 100 were idle: 200/300 busy.
+        let second = parse_cpu_times("cpu  200 0 200 900 0 0 0 0 0 0\n").unwrap();
+        assert_eq!(cpu_usage_pct(&first, &second), Some(67));
+
+        // No busy ticks at all.
+        let idle_only = parse_cpu_times("cpu  100 0 100 900 0 0 0 0 0 0\n").unwrap();
+        assert_eq!(cpu_usage_pct(&first, &idle_only), Some(0));
+
+        // Two reads at the same instant cannot produce a percentage.
+        assert_eq!(cpu_usage_pct(&first, &first), None);
+
+        assert!(parse_cpu_times("intr 1 2 3\n").is_none());
+        assert!(parse_cpu_times("cpu  x 0 0 0\n").is_none(), "non-numeric counters are rejected");
     }
 
     #[test]

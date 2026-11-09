@@ -112,6 +112,13 @@ they stay neutral rather than being reported as down.
   units, so a 4 TB disk reads `4.0 TB`), cores from `available_parallelism`, link speed
   from `/sys/class/net/*/speed`. Memory is binary, because that is how RAM is sold and
   reported everywhere else.
+- **Machine cards** — CPU usage, load averages and memory from `/proc`, in the same
+  tiles as the GPU panel. CPU usage comes from two `/proc/stat` reads 150 ms apart:
+  a single read is an average over the machine's whole uptime and never moves. Memory
+  "used" is `MemTotal - MemAvailable`, so reclaimable page cache does not read as a
+  leak. Values are baked in at generation time and refreshed in place from Glances
+  every 3 seconds when one is configured; unlike the GPU cards, a failed poll leaves
+  the build-time numbers rather than blanking the tiles.
 - **GPU cards** — from `nvidia-smi` at generation time, refreshed from the Glances API
   every 3 seconds when one is configured. The URL is fetched by the *browser*, so
   `localhost` there means the viewer's machine; the tool warns when it sees one.

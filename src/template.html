@@ -19,17 +19,20 @@
   a { color: #9ece6a; text-decoration: none; transition: color .15s, background-color .15s; }
   a:hover { color: #b9f27c; }
 
-  /* GPU section */
-  .gpu-section { margin: 0 0 2rem; }
-  .gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .65rem; }
-  .gpu-card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: .85rem 1.1rem; transition: border-color .15s; }
-  .gpu-card:hover { border-color: #7aa2f7; }
-  .gpu-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .45rem; color: #c0caf5; font-weight: 600; font-size: .88rem; }
-  .gpu-icon { font-size: 1.25rem; }
-  .gpu-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: .35rem; margin-top: .5rem; }
-  .gpu-metric { background: #16161ef0; padding: .35rem .55rem; border-radius: 4px; font-size: .72rem; color: #7aa2f7; }
-  .gpu-label { color: #565f89; margin-right: .25rem; }
+  /* GPU + machine cards share one tile look */
+  .gpu-section, .sys-section { margin: 0 0 2rem; }
+  .gpu-grid, .sys-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .65rem; }
+  .gpu-card, .sys-card { background: #1e2030; border: 1px solid #292e42; border-radius: 6px; padding: .85rem 1.1rem; transition: border-color .15s; }
+  .gpu-card:hover, .sys-card:hover { border-color: #7aa2f7; }
+  .gpu-header, .sys-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .45rem; color: #c0caf5; font-weight: 600; font-size: .88rem; }
+  .gpu-icon, .sys-icon { font-size: 1.25rem; }
+  .gpu-metrics, .sys-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: .35rem; margin-top: .5rem; }
+  .gpu-metric, .sys-metric { background: #16161ef0; padding: .35rem .55rem; border-radius: 4px; font-size: .72rem; color: #7aa2f7; }
+  .gpu-label, .sys-label { color: #565f89; margin-right: .25rem; }
   .gpu-note { color: #3d425a; font-size: .72rem; }
+  .sys-value { font-size: 1.55rem; }
+  .sys-unit { font-size: .85rem; color: #565f89; margin-left: .2rem; }
+  .sys-note { color: #565f89; margin-left: .3rem; font-size: .78rem; }
 
   /* service cards + health states */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: .75rem; }
@@ -88,6 +91,8 @@
 </div>
 
 <!-- GPU_SECTION -->
+
+<!-- SYSTEM_SECTION -->
 
 <!-- GROUPS -->
 
@@ -180,6 +185,61 @@ function renderGPUs() {
     .catch(() => {
       container.innerHTML = '<span class="gpu-note">GPU stats unavailable</span>';
     });
+}
+
+// ─────────────────────────── machine stats ───────────────────────────
+// CPU, load and memory are baked in from /proc at build time; Glances, when it is
+// configured, refreshes the numbers in place. A failed poll deliberately leaves the
+// generation-time values visible instead of blanking the cards.
+function usageColour(pct) {
+  if (pct > 80) return '#ff6e6a';
+  if (pct > 40) return '#e5f07a';
+  return '#9ece6a';
+}
+
+function setUsage(id, pct) {
+  const el = document.getElementById(id);
+  if (!el || pct == null || isNaN(pct)) return;
+  el.textContent = Math.round(pct);
+  el.style.color = usageColour(pct);
+}
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function gib(bytes) {
+  const g = bytes / 1024 / 1024 / 1024;
+  return (g < 10 ? g.toFixed(1) : Math.round(g)) + ' GB';
+}
+
+async function renderSystem() {
+  const container = document.getElementById('sys-list');
+  const api = container ? (container.dataset.live || '') : '';
+  if (!container || !api) return;
+
+  const get = path => fetch(api + path).then(r => r.json()).catch(() => null);
+  const [cpu, mem, swap, load] = await Promise.all([
+    get('/api/4/cpu'), get('/api/4/mem'), get('/api/4/memswap'), get('/api/4/load'),
+  ]);
+
+  if (cpu && cpu.total != null) setUsage('sys-cpu-pct', cpu.total);
+
+  if (mem && mem.percent != null) setUsage('sys-mem-pct', mem.percent);
+  if (mem && mem.used != null && mem.total != null) {
+    setText('sys-mem-used', gib(mem.used) + ' / ' + gib(mem.total));
+  }
+  if (swap && swap.total != null) {
+    setText('sys-mem-swap', swap.total > 0 ? gib(swap.used || 0) + ' / ' + gib(swap.total) : 'none');
+  }
+
+  if (load && load.min1 != null) {
+    for (const [id, key] of [['sys-load1', 'min1'], ['sys-load5', 'min5'], ['sys-load15', 'min15']]) {
+      if (load[key] != null) setText(id, Number(load[key]).toFixed(2));
+    }
+    if (load.cpucore > 0) setText('sys-cpu-cores', load.cpucore);
+  }
 }
 
 // ─────────────────────────── speed test ───────────────────────────
@@ -350,6 +410,8 @@ document.getElementById('refresh').addEventListener('click', refreshStatus);
 refreshStatus();
 renderGPUs();
 setInterval(renderGPUs, 3000);
+renderSystem();
+setInterval(renderSystem, 3000);
 setInterval(refreshStatus, 30000);
 </script>
 </body>

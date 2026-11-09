@@ -429,6 +429,91 @@ fn render_gpu_section(output: &WizardOutput) -> String {
     )
 }
 
+/// Green below 40% usage, amber above, red above 80% — the same scale the GPU
+/// cards use, so a full CPU reads the same colour as a full VRAM.
+fn usage_colour(pct: f64) -> &'static str {
+    if pct > 80.0 {
+        "#ff6e6a"
+    } else if pct > 40.0 {
+        "#e5f07a"
+    } else {
+        "#9ece6a"
+    }
+}
+
+/// `62 GB` from a mebibyte count, in the binary units the chips already use.
+fn fmt_memory(mb: u64) -> String {
+    crate::discover::human_bytes(mb.saturating_mul(1024 * 1024))
+}
+
+/// The machine panel: CPU, load and memory sampled at generation time, refreshed
+/// from the Glances API when one is configured.
+///
+/// This is the companion to the GPU panel: the same tile look and the same rule that
+/// the page is useful before JavaScript runs. Glances only refreshes values in place,
+/// so a failed poll leaves the build-time numbers rather than a blank tile.
+fn render_system_section(output: &WizardOutput) -> String {
+    let stats = &output.system;
+    let live = output.glances_api_base.as_deref().unwrap_or("").trim();
+    if stats.is_empty() && live.is_empty() {
+        return String::new();
+    }
+
+    let cores = if stats.cpu_count > 0 { stats.cpu_count.to_string() } else { "-".to_string() };
+
+    let cpu = stats.cpu_pct;
+    let cpu_text = cpu.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    let cpu_colour = cpu.map(|v| usage_colour(v as f64)).unwrap_or("#7aa2f7");
+    let load_text = |v: Option<f32>| v.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+    let (load1, load5, load15) = match stats.load {
+        Some(l) => (load_text(Some(l.one)), load_text(Some(l.five)), load_text(Some(l.fifteen))),
+        None => ("-".to_string(), "-".to_string(), "-".to_string()),
+    };
+
+    let mem_pct = stats.mem_pct();
+    let mem_text = mem_pct.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    let mem_colour = mem_pct.map(|v| usage_colour(v as f64)).unwrap_or("#7aa2f7");
+    // Available is total minus used, so it would only repeat the tiles around it.
+    let (mem_used, mem_swap) = match stats.mem {
+        Some(m) => (
+            format!("{} / {}", fmt_memory(m.used_mb), fmt_memory(m.total_mb)),
+            if m.swap_total_mb == 0 {
+                "none".to_string()
+            } else {
+                format!("{} / {}", fmt_memory(m.swap_used_mb), fmt_memory(m.swap_total_mb))
+            },
+        ),
+        None => ("-".to_string(), "-".to_string()),
+    };
+
+    format!(
+        r#"<!-- MACHINE STATS -->
+<div class="sys-section">
+  <div class="sys-grid" id="sys-list" data-live="{live}">
+  <div class="sys-card" id="sys-cpu">
+    <div class="sys-header"><span class="sys-icon">&#x1F5A5;</span> CPU</div>
+    <strong class="sys-value"><span id="sys-cpu-pct" style="color:{cpu_colour};">{cpu_text}</span><span class="sys-unit">%</span></strong><span class="sys-note">usage</span>
+    <div class="sys-metrics">
+      <div class="sys-metric"><span class="sys-label">Cores:</span><span id="sys-cpu-cores">{cores}</span></div>
+      <div class="sys-metric"><span class="sys-label">Load 1m:</span><span id="sys-load1">{load1}</span></div>
+      <div class="sys-metric"><span class="sys-label">Load 5m:</span><span id="sys-load5">{load5}</span></div>
+      <div class="sys-metric"><span class="sys-label">Load 15m:</span><span id="sys-load15">{load15}</span></div>
+    </div>
+  </div>
+  <div class="sys-card" id="sys-mem">
+    <div class="sys-header"><span class="sys-icon">&#x1F9E0;</span> Memory</div>
+    <strong class="sys-value"><span id="sys-mem-pct" style="color:{mem_colour};">{mem_text}</span><span class="sys-unit">%</span></strong><span class="sys-note">used</span>
+    <div class="sys-metrics">
+      <div class="sys-metric" style="grid-column: span 2;"><span class="sys-label">Used:</span><span id="sys-mem-used">{mem_used}</span></div>
+      <div class="sys-metric" style="grid-column: span 2;"><span class="sys-label">Swap:</span><span id="sys-mem-swap">{mem_swap}</span></div>
+    </div>
+  </div>
+  </div>
+</div>
+"#,
+    )
+}
+
 /// `2026-10-16 15:42` — no chrono dependency for one timestamp.
 fn now_string() -> String {
     std::process::Command::new("date")
@@ -462,6 +547,7 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         &render_groups(&output.selected_services, hostname, output.inline_icons),
     );
     html = html.replace("<!-- GPU_SECTION -->", &render_gpu_section(output));
+    html = html.replace("<!-- SYSTEM_SECTION -->", &render_system_section(output));
     html = html.replace("<!-- SYS_CHIPS -->", &render_sys_chips(output));
     html = html.replace("<!-- SYSPLASH_CONFIG -->", &resync_config(output, hostname));
     html = html.replace("<!-- MODULES -->", &output.extra_cards.join(""));
@@ -524,6 +610,20 @@ fn write_dashboard_json(output: &WizardOutput, title: &str, subtitle: &str, gene
         })
         .collect();
 
+    let system = &output.system;
+    let load_average = system.load.map(|l| {
+        serde_json::json!({ "one": l.one, "five": l.five, "fifteen": l.fifteen })
+    });
+    let memory = system.mem.map(|m| {
+        serde_json::json!({
+            "total_mb": m.total_mb,
+            "used_mb": m.used_mb,
+            "available_mb": m.available_mb,
+            "swap_total_mb": m.swap_total_mb,
+            "swap_used_mb": m.swap_used_mb,
+        })
+    });
+
     let doc = serde_json::json!({
         "generated_at": generated,
         "generator_build": crate::build_stamp(),
@@ -532,6 +632,10 @@ fn write_dashboard_json(output: &WizardOutput, title: &str, subtitle: &str, gene
         "title": title,
         "subtitle": subtitle,
         "glances_api_base": output.glances_api_base,
+        "cpu_pct": system.cpu_pct,
+        "cpu_count": system.cpu_count,
+        "load_average": load_average,
+        "memory": memory,
         "services": services,
     });
 
@@ -595,6 +699,7 @@ mod tests {
             output_file: "index.html".to_string(),
             extra_cards: Vec::new(),
             gpus: Vec::new(),
+            system: crate::discover::SystemStats::default(),
             sys_chips: Vec::new(),
             speedtest_bytes: 0,
             overrides_path: std::path::PathBuf::from("/nonexistent/overrides.toml"),
@@ -728,6 +833,8 @@ mod tests {
             "<!-- SUBTITLE -->",
             "<!-- GROUPS -->",
             "<!-- MODULES -->",
+            "<!-- GPU_SECTION -->",
+            "<!-- SYSTEM_SECTION -->",
             "<!-- FOOTER -->",
         ] {
             assert!(!html.contains(placeholder), "{placeholder} was not substituted");
@@ -848,6 +955,18 @@ mod tests {
                 crate::discover::Gpu { name: "NVIDIA GeForce RTX 3090".into(), mem_pct: 57, temp_c: Some(37), fan_pct: Some(0), util_pct: Some(12) },
                 crate::discover::Gpu { name: "AMD GPU".into(), mem_pct: 0, temp_c: Some(46), fan_pct: None, util_pct: Some(0) },
             ],
+            system: crate::discover::SystemStats {
+                load: Some(crate::discover::LoadAverage { one: 2.83, five: 2.66, fifteen: 2.46 }),
+                cpu_pct: Some(37),
+                mem: Some(crate::discover::MemInfo {
+                    total_mb: 62068,
+                    used_mb: 23800,
+                    available_mb: 38268,
+                    swap_total_mb: 8192,
+                    swap_used_mb: 0,
+                }),
+                cpu_count: 24,
+            },
             sys_chips: vec![
                 "64 GB RAM".into(),
                 "12 TB across 3 disks".into(),
@@ -897,9 +1016,90 @@ mod tests {
         assert!(html.contains("card status-up"), "HTTP services were up when sampled");
         assert!(html.contains(r#"data-live="http://ginger.local:61208""#), "GPU cards poll Glances");
         assert!(html.contains("59"), "VRAM is baked in from nvidia-smi");
+        assert!(
+            html.contains(r#"id="sys-list" data-live="http://ginger.local:61208""#),
+            "machine cards poll Glances"
+        );
+        assert!(html.contains(r#"id="sys-cpu-pct""#), "CPU usage is baked in from /proc");
+        assert!(html.contains("2.83"), "load averages are baked in");
+        assert!(html.contains(r#"<span id="sys-mem-pct""#), "memory usage is baked in");
         assert!(html.contains(r#"href="ssh://ginger.local:22""#));
         assert!(html.contains(r#"href="http://ginger.local:11434""#));
         assert!(html.contains("</html>"));
+    }
+
+    fn sample_system() -> crate::discover::SystemStats {
+        crate::discover::SystemStats {
+            load: Some(crate::discover::LoadAverage { one: 1.5, five: 1.25, fifteen: 0.75 }),
+            cpu_pct: Some(23),
+            mem: Some(crate::discover::MemInfo {
+                total_mb: 16384,
+                used_mb: 8192,
+                available_mb: 8192,
+                swap_total_mb: 0,
+                swap_used_mb: 0,
+            }),
+            cpu_count: 8,
+        }
+    }
+
+    #[test]
+    fn machine_stats_render_without_javascript() {
+        let mut out = output_with(vec![]);
+        out.glances_api_base = None;
+        out.system = sample_system();
+
+        let html = render_system_section(&out);
+        assert!(
+            html.contains(r#"<span id="sys-cpu-pct" style="color:#9ece6a;">23</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("1.50") && html.contains("1.25") && html.contains("0.75"),
+            "load averages: {html}"
+        );
+        assert!(html.contains(">8<"), "the core count qualifies the load: {html}");
+        assert!(
+            html.contains(r#"<span id="sys-mem-pct" style="color:#e5f07a;">50</span>"#),
+            "{html}"
+        );
+        assert!(html.contains("8.0 GB / 16 GB"), "used of total: {html}");
+        assert!(html.contains(">none<"), "a machine without swap says so, not 0 GB: {html}");
+        assert!(html.contains("&#x1F5A5;") && html.contains("&#x1F9E0;"));
+
+        // Nothing known and no Glances to fill it in: no panel, rather than a row of
+        // dashes pretending to be data.
+        let mut empty = output_with(vec![]);
+        empty.glances_api_base = None;
+        assert_eq!(render_system_section(&empty), "");
+
+        // With Glances configured the cards render even before the first fetch, so the
+        // browser has somewhere to put the live numbers.
+        let live_only = output_with(vec![]);
+        assert!(render_system_section(&live_only)
+            .contains(r#"id="sys-list" data-live="http://ginger.local:61208""#));
+    }
+
+    #[test]
+    fn dashboard_json_carries_the_machine_stats() {
+        let dir = std::env::temp_dir().join("splash-system-json-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut out = output_with(vec![]);
+        out.output_dir = dir.clone();
+        out.system = sample_system();
+        generate(&out).unwrap();
+
+        let meta = std::fs::read_to_string(dir.join("dashboard.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["cpu_pct"], 23);
+        assert_eq!(parsed["cpu_count"], 8);
+        assert_eq!(parsed["load_average"]["one"], 1.5);
+        assert_eq!(parsed["memory"]["total_mb"], 16384);
+        assert_eq!(parsed["memory"]["used_mb"], 8192);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

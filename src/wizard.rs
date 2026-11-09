@@ -226,6 +226,9 @@ pub(crate) struct WizardOutput {
     /// GPUs read from `nvidia-smi` at generation time. Rendered into the page so the
     /// stats are there on first paint, with Glances refreshing them live.
     pub gpus: Vec<crate::discover::Gpu>,
+    /// Load, CPU and memory sampled at generation time. Same two-stage treatment as
+    /// the GPUs: baked in for a static page, refreshed from Glances when available.
+    pub system: crate::discover::SystemStats,
     /// Short facts shown under the title: `64 GB RAM`, `4.0 TB across 3 disks`, …
     pub sys_chips: Vec<String>,
     /// Size of the downloadable payload used by the in-page speed test. 0 disables it.
@@ -515,6 +518,7 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
                 deploy_path: None,
                 extra_cards: Vec::new(),
                 gpus: machine.gpus.clone(),
+                system: machine.system.clone(),
                 sys_chips: machine.stat_chips(),
                 speedtest_bytes: config.speedtest_bytes(),
                 overrides_path: config.get_overrides_path(),
@@ -993,6 +997,7 @@ fn curate_and_finish(
         deploy_path,
         extra_cards: Vec::new(),
         gpus: machine.gpus.clone(),
+        system: machine.system.clone(),
         sys_chips: machine.stat_chips(),
         speedtest_bytes: config.speedtest_bytes(),
         overrides_path: config.get_overrides_path(),

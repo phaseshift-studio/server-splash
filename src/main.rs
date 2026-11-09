@@ -365,6 +365,7 @@ fn run_auto(cfg: &SplashConfig) -> Result<WizardOutput, String> {
         deploy_path: cfg.deploy_path.clone(),
         extra_cards: Vec::new(),
         gpus: discovery.machine.gpus.clone(),
+        system: discovery.machine.system.clone(),
         sys_chips: discovery.machine.stat_chips(),
         speedtest_bytes: cfg.speedtest_bytes(),
         overrides_path: cfg.get_overrides_path(),

@@ -31,6 +31,10 @@ at generation time is baked in too, so the page is still useful with JavaScript 
 **GPU panels.** VRAM, utilisation, temperature and fan for each card, filled in from
 `nvidia-smi` at generation time and refreshed live from [Glances][glances] if you run it.
 
+**Machine panel.** CPU usage, load average and RAM used, beside the GPU cards. Sampled
+from `/proc` when the page is generated, so it is there without JavaScript, and
+refreshed live from Glances when one is configured.
+
 **System stats.** `64 GB RAM · 12 TB across 4 disks · 24 cores · eno1 1 Gb/s` under the
 title, from `/proc`, `lsblk` and `/sys`.
 
@@ -144,8 +148,9 @@ These exist so a container needs no config file — see `docker-compose.yml`.
 | `SPLASH_BACKUP_DIR` | `~/.local/share/server-splash/backups` | Pre-deploy backups. |
 
 > **`SPLASH_GLANCES` is fetched by your browser, not by the server.** `localhost` there
-> means *your* machine, so the GPU panel would silently stay empty. Use the address you
-> reach the dashboard on. The tool warns when it sees a loopback URL.
+> means *your* machine, so the GPU and machine panels would silently stay at their
+> generation-time values. Use the address you reach the dashboard on. The tool warns
+> when it sees a loopback URL.
 
 ### Config file
 
