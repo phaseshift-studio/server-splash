@@ -224,7 +224,13 @@ async function renderSystem() {
     get('/api/4/cpu'), get('/api/4/mem'), get('/api/4/memswap'), get('/api/4/load'),
   ]);
 
-  if (cpu && cpu.total != null) setUsage('sys-cpu-pct', cpu.total);
+  // Glances occasionally reports a transient total of 0 between its own samples. On a
+  // machine with real load that is obviously not a measurement, so keep the previous
+  // value rather than flickering a busy machine to 0% every few seconds.
+  const load1 = load && load.min1 != null ? Number(load.min1) : null;
+  if (cpu && cpu.total != null && (Number(cpu.total) > 0 || load1 == null || load1 < 0.5)) {
+    setUsage('sys-cpu-pct', cpu.total);
+  }
 
   if (mem && mem.percent != null) setUsage('sys-mem-pct', mem.percent);
   if (mem && mem.used != null && mem.total != null) {
