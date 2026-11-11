@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::fs;
+use crate::peers::Peer;
 use crate::wizard::{SplashService, WizardOutput};
 
 /// The studio that builds this tool, linked from every generated page.
@@ -310,6 +311,111 @@ fn render_groups(services: &[SplashService], hostname: &str, inline_icons: bool)
     out
 }
 
+/// One card per peer machine.
+///
+/// Deliberately built from the same `.card` markup as a service card: the status
+/// light, the hover treatment and the health script come for free, and a machine you
+/// can click looks exactly like a service you can click.
+fn render_peer_card(peer: &Peer, inline_icons: bool) -> String {
+    let icon = peer.icon_or_default();
+    // Provenance beats a curated tag: a machine that arrived over federation must say so,
+    // so it is never mistaken for one that is in `peers.toml`.
+    let tag_text = peer
+        .learned_from
+        .as_ref()
+        .map(|from| format!("via {from}"))
+        .or_else(|| {
+            // A remembered address is a guess, so the card says how old the guess is.
+            peer.last_seen.map(last_seen_text)
+        })
+        .or_else(|| {
+            peer.group
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| match peer.source.as_deref() {
+            Some(crate::peers::SOURCE_MDNS) => Some("discovered".to_string()),
+            _ => None,
+        });
+    let tag = tag_text
+        .map(|g| format!("<span class=\"peer-tag\">{}</span>", esc(&g)))
+        .unwrap_or_default();
+
+    // A configured or remembered machine was asked at generation time, so the static
+    // page already knows whether it answered; anything else stays unknown until the
+    // browser's probe runs.
+    let initial = match peer.alive {
+        Some(true) => "status-up",
+        Some(false) => "status-down",
+        None => "status-unknown",
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<a class=\"card {initial} peer\" href=\"{}\"",
+        esc_attr(&peer.url)
+    ));
+    if peer.probes() {
+        // The browser asks the other machine whether it is up, the same way it checks
+        // a service here. `no-cors` means a peer without CORS headers still answers
+        // the only question being asked: is anything listening?
+        out.push_str(&format!(" data-probe=\"{}\"", esc_attr(&peer.url)));
+    }
+    // Deliberately *not* `data-service`: the resync pass harvests ports from those
+    // cards, and this port belongs to a different machine.
+    out.push_str(&format!(" data-peer=\"{}\">\n", esc_attr(&peer.name)));
+    out.push_str("  <span class=\"status-icon\" aria-hidden=\"true\">&#x25CF;</span>\n");
+    if is_image_icon(&icon) {
+        out.push_str(&format!(
+            "  <span class=\"icon\"><img class=\"icon-img\" src=\"{}\" alt=\"\"></span>\n",
+            esc_attr(&icon_src(&icon, None, inline_icons))
+        ));
+    } else {
+        out.push_str(&format!("  <span class=\"icon\">{}</span>\n", esc_attr(&icon)));
+    }
+    out.push_str(&format!(
+        "  <div class=\"info\"><span class=\"name\">{}</span><br><span class=\"desc\">{}</span></div>\n",
+        esc_attr(&peer.name),
+        esc_attr(&peer.desc_or_default())
+    ));
+    out.push_str(&format!(
+        "  <div class=\"link-wrap\">{tag}<span class=\"link\">{}</span></div>\n",
+        esc_attr(&peer.display_target())
+    ));
+    out.push_str("</a>\n");
+    out
+}
+
+/// The `Machines` section, or nothing at all when no peers are configured.
+///
+/// Empty means the generated page is byte-for-byte what it was before this feature
+/// existed, which keeps the diff honest for everyone not using it.
+fn render_peers(output: &WizardOutput, inline_icons: bool) -> String {
+    let mut visible: Vec<&Peer> = output.peers.iter().filter(|p| !p.is_hidden()).collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+    // Stable order: the machines you wrote down first, then the ones that turned up by
+    // themselves; within each, by tag then name. Adding a peer must not reshuffle the
+    // ones already on the page.
+    visible.sort_by_key(|p| {
+        (
+            p.source.as_deref() != Some(crate::peers::SOURCE_CONFIG),
+            p.group.as_deref().unwrap_or("").trim().to_lowercase(),
+            p.name.to_lowercase(),
+        )
+    });
+
+    let mut out = String::from("<h2>&#x1F5A5;&#xFE0F; Machines</h2>\n<div class=\"grid\">\n");
+    for peer in visible {
+        out.push_str(&render_peer_card(peer, inline_icons));
+    }
+    out.push_str("</div>\n\n");
+    out
+}
+
 /// The chip row under the title: RAM, storage, cores, link speed.
 fn render_sys_chips(output: &WizardOutput) -> String {
     output
@@ -515,6 +621,25 @@ fn render_system_section(output: &WizardOutput) -> String {
 }
 
 /// `2026-10-16 15:42` — no chrono dependency for one timestamp.
+/// The shortest honest form of an age: `just now`, `12m ago`, `3h ago`, `6d ago`.
+fn ago_text(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// `last seen 3h ago` — the label on a machine remembered from an earlier run.
+fn last_seen_text(epoch: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(epoch);
+    format!("last seen {}", ago_text(now.saturating_sub(epoch)))
+}
+
 fn now_string() -> String {
     std::process::Command::new("date")
         .arg("+%Y-%m-%d %H:%M")
@@ -549,8 +674,11 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     html = html.replace("<!-- GPU_SECTION -->", &render_gpu_section(output));
     html = html.replace("<!-- SYSTEM_SECTION -->", &render_system_section(output));
     html = html.replace("<!-- SYS_CHIPS -->", &render_sys_chips(output));
+    html = html.replace("<!-- PEERS -->", &render_peers(output, output.inline_icons));
     html = html.replace("<!-- SYSPLASH_CONFIG -->", &resync_config(output, hostname));
     html = html.replace("<!-- MODULES -->", &output.extra_cards.join(""));
+    // The page remembers what it found, so the next generation can retry it.
+    html = html.replace("<!-- CACHE -->", &crate::cache::comment(&output.cache));
 
     let ip = if output.ip_display.is_empty() { "*".to_string() } else { output.ip_display.clone() };
     let generated = now_string();
@@ -574,6 +702,9 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
         write_icons(output)?;
     }
     write_speedtest_payload(output)?;
+    // The two files a peer reads: who we are, and who we vouch for.
+    write_identity(output, &title)?;
+    write_peers_file(output)?;
 
     let file_name = if output.output_file.is_empty() { "index.html".to_string() } else { output.output_file.clone() };
     let out_path = out_dir.join(&file_name);
@@ -585,6 +716,59 @@ pub(crate) fn generate(output: &WizardOutput) -> Result<String, String> {
     write_dashboard_json(output, &title, &subtitle, &generated);
 
     Ok(out_path.to_string_lossy().to_string())
+}
+
+/// Publish this dashboard's identity at `/.well-known/splash.json`.
+///
+/// Identity only: what it is, what version, and where its peer list lives. It names no
+/// service and no port, for the same reason `dashboard.json` is never deployed — a file
+/// announcing the box should not also enumerate the ways in. Anything that scans for
+/// dashboards can use this to tell one from an unrelated web server.
+fn write_identity(output: &WizardOutput, title: &str) -> Result<(), String> {
+    let dir = output.output_dir.join(".well-known");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+
+    let doc = serde_json::json!({
+        "generator": crate::peers::PeerDoc::GENERATOR,
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": crate::build_stamp(),
+        "name": output.hostname,
+        "title": title,
+        "peers": "peers.json",
+    });
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let path = dir.join("splash.json");
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Publish `/peers.json`: the machines this dashboard will vouch for.
+///
+/// Only machines written into `peers.toml` are published (see `peers::advertised`) —
+/// never one discovered over mDNS or learned from another dashboard. That is what keeps
+/// gossip to one hop, and keeps this machine's LAN neighbours off the internet by
+/// accident when the page is deployed to a public host.
+fn write_peers_file(output: &WizardOutput) -> Result<(), String> {
+    let path = output.output_dir.join("peers.json");
+
+    // Turning publishing off must also retract what the previous run published.
+    let advertised = if output.publish_peers {
+        crate::peers::advertised(&output.peers)
+    } else {
+        Vec::new()
+    };
+    if advertised.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+
+    let doc = crate::peers::PeerDoc::new(
+        &output.hostname,
+        env!("CARGO_PKG_VERSION"),
+        advertised,
+    );
+    let text = doc.to_json().ok_or("could not serialise the peer list")?;
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 fn write_dashboard_json(output: &WizardOutput, title: &str, subtitle: &str, generated: &str) {
@@ -637,6 +821,20 @@ fn write_dashboard_json(output: &WizardOutput, title: &str, subtitle: &str, gene
         "load_average": load_average,
         "memory": memory,
         "services": services,
+        "peers": output
+            .peers
+            .iter()
+            .filter(|p| !p.is_hidden())
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "url": p.url,
+                    "desc": p.desc,
+                    "group": p.group,
+                    "source": p.source,
+                })
+            })
+            .collect::<Vec<_>>(),
     });
 
     if let Ok(text) = serde_json::to_string_pretty(&doc) {
@@ -704,6 +902,9 @@ mod tests {
             speedtest_bytes: 0,
             overrides_path: std::path::PathBuf::from("/nonexistent/overrides.toml"),
             inline_icons: true,
+            peers: Vec::new(),
+            publish_peers: true,
+            cache: Vec::new(),
         }
     }
 
@@ -833,6 +1034,7 @@ mod tests {
             "<!-- SUBTITLE -->",
             "<!-- GROUPS -->",
             "<!-- MODULES -->",
+            "<!-- CACHE -->",
             "<!-- GPU_SECTION -->",
             "<!-- SYSTEM_SECTION -->",
             "<!-- FOOTER -->",
@@ -976,6 +1178,9 @@ mod tests {
             speedtest_bytes: 8 * 1024 * 1024,
             overrides_path: std::path::PathBuf::from("/nonexistent/overrides.toml"),
             inline_icons: true,
+            peers: Vec::new(),
+            publish_peers: true,
+            cache: Vec::new(),
         };
         let path = generate(&out).unwrap();
         let html = std::fs::read_to_string(&path).unwrap();
@@ -1276,6 +1481,210 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    fn peer(name: &str, url: &str) -> Peer {
+        Peer { name: name.to_string(), url: url.to_string(), ..Peer::default() }
+    }
+
+    #[test]
+    fn peers_render_as_a_machines_section() {
+        let mut out = output_with(Vec::new());
+        out.peers = vec![
+            Peer { group: Some("LAN".into()), desc: Some("GPU box".into()), ..peer("ginger", "http://ginger.local:6420") },
+            Peer { group: Some("WAN".into()), ..peer("basil", "https://basil.example.com") },
+        ];
+        let html = render_peers(&out, true);
+
+        assert!(html.contains("Machines"), "the section needs a heading: {html}");
+        assert!(html.contains(r#"href="http://ginger.local:6420""#), "{html}");
+        assert!(html.contains(r#"href="https://basil.example.com""#), "{html}");
+        assert!(html.contains(">LAN<") && html.contains(">WAN<"), "the group tag is shown: {html}");
+        assert!(html.contains("ginger.local:6420</span>"), "the chip drops the scheme: {html}");
+        assert!(html.contains("GPU box"), "{html}");
+        assert!(html.contains("basil.example.com</span>"), "a peer without a desc falls back to its host: {html}");
+
+        // LAN sorts before WAN regardless of file order.
+        assert!(html.find("ginger").unwrap() < html.find("basil").unwrap(), "{html}");
+    }
+
+    #[test]
+    fn a_learned_peer_says_who_taught_us_about_it() {
+        // Provenance outranks a curated tag: a machine you never wrote down must be
+        // obviously not one of yours, even if the machine that told you about it had
+        // tagged it.
+        let mut out = output_with(Vec::new());
+        out.peers = vec![Peer {
+            group: Some("WAN".into()),
+            learned_from: Some("bravo.local".into()),
+            source: Some(crate::peers::SOURCE_FEDERATION.into()),
+            ..peer("carol", "http://carol.local:6420")
+        }];
+        let html = render_peers(&out, true);
+        assert!(html.contains("via bravo.local"), "the card names its source: {html}");
+        assert!(!html.contains(">WAN<"), "and not the tag of the machine that mentioned it: {html}");
+    }
+
+    #[test]
+    fn a_cached_peer_says_how_old_the_memory_is() {
+        // The address is a hint, so the card must not present it as a discovery.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut out = output_with(Vec::new());
+        out.peers = vec![Peer {
+            source: Some(crate::peers::SOURCE_CACHE.into()),
+            last_seen: Some(now - 3 * 3_600),
+            ..peer("bravo", "http://bravo.local:6422")
+        }];
+
+        let html = render_peers(&out, true);
+        assert!(html.contains("last seen 3h ago"), "the age is on the card: {html}");
+        assert!(html.contains(r#"href="http://bravo.local:6422""#), "and it is still clickable: {html}");
+    }
+
+    #[test]
+    fn the_page_carries_the_machines_it_should_remember() {
+        let dir = std::env::temp_dir().join("splash-memory-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut out = output_with(Vec::new());
+        out.output_dir = dir.clone();
+        out.peers = vec![Peer {
+            source: Some(crate::peers::SOURCE_MDNS.into()),
+            ..peer("ginger", "http://ginger.local:6420")
+        }];
+        out.cache = vec![peer("ginger", "http://ginger.local:6420")];
+
+        let path = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.contains("<!-- CACHE {"), "the memory rides in the page: {path}");
+        assert!(!html.contains("<!-- CACHE -->"), "the slot itself is gone: {path}");
+
+        // And the next generation can read it straight back out of the page it built.
+        let remembered = crate::cache::read(std::path::Path::new(&path), std::time::Duration::from_secs(86_400));
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].url, "http://ginger.local:6420");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_page_with_nothing_to_remember_carries_no_comment() {
+        let dir = std::env::temp_dir().join("splash-memory-empty-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut out = output_with(Vec::new());
+        out.output_dir = dir.clone();
+        let path = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(!html.contains("<!-- CACHE"), "an empty memory leaves no trace: {path}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_peer_we_asked_shows_whether_it_answered() {
+        let mut out = output_with(Vec::new());
+        out.peers = vec![
+            Peer { alive: Some(true), source: Some(crate::peers::SOURCE_CONFIG.into()), ..peer("up", "http://up.local:6420") },
+            Peer { alive: Some(false), source: Some(crate::peers::SOURCE_CONFIG.into()), ..peer("down", "http://down.local:6420") },
+            Peer { source: Some(crate::peers::SOURCE_MDNS.into()), ..peer("fresh", "http://fresh.local:6420") },
+        ];
+        let html = render_peers(&out, true);
+
+        assert!(html.contains(r#"class="card status-up peer" href="http://up.local:6420""#), "{html}");
+        assert!(html.contains(r#"class="card status-down peer" href="http://down.local:6420""#), "{html}");
+        assert!(
+            html.contains(r#"class="card status-unknown peer" href="http://fresh.local:6420""#),
+            "a machine nobody asked is left to the browser: {html}"
+        );
+    }
+
+    #[test]
+    fn ages_are_reported_in_the_shortest_honest_unit() {
+        assert_eq!(ago_text(0), "just now");
+        assert_eq!(ago_text(59), "just now");
+        assert_eq!(ago_text(60), "1m ago");
+        assert_eq!(ago_text(3_599), "59m ago");
+        assert_eq!(ago_text(3_600), "1h ago");
+        assert_eq!(ago_text(86_399), "23h ago");
+        assert_eq!(ago_text(86_400), "1d ago");
+        assert_eq!(ago_text(29 * 86_400), "29d ago");
+    }
+
+    #[test]
+    fn no_peers_means_no_machines_section() {
+        let out = output_with(Vec::new());
+        assert_eq!(render_peers(&out, true), "", "an unconfigured page must not grow an empty section");
+    }
+
+    #[test]
+    fn hidden_peers_stay_out_of_the_page() {
+        let mut out = output_with(Vec::new());
+        out.peers = vec![
+            Peer { hidden: Some(true), ..peer("retired", "http://old.local:6420") },
+            peer("ginger", "http://ginger.local:6420"),
+        ];
+        let html = render_peers(&out, true);
+        assert!(!html.contains("retired"), "hidden peers are kept in the file, not the page: {html}");
+        assert!(html.contains("ginger"));
+    }
+
+    #[test]
+    fn peer_cards_do_not_feed_the_resync_port_scan() {
+        // The resync pass harvests ports from `.card[data-service]`; a peer's port
+        // belongs to another machine and must not suppress a local discovery.
+        let mut out = output_with(Vec::new());
+        out.peers = vec![peer("ginger", "http://ginger.local:8080")];
+        let card = render_peers(&out, true);
+        assert!(!card.contains("data-service="), "peer cards must not be service cards: {card}");
+        assert!(card.contains("data-peer="), "they are marked as peers instead: {card}");
+        assert!(card.contains(r#"data-probe="http://ginger.local:8080""#), "reachability is checked live: {card}");
+    }
+
+    #[test]
+    fn a_peer_can_opt_out_of_the_status_light() {
+        let mut out = output_with(Vec::new());
+        out.peers = vec![Peer { probe: Some(false), ..peer("far", "https://far.example.com") }];
+        let html = render_peers(&out, true);
+        assert!(!html.contains("data-probe"), "probe = false removes the live check: {html}");
+        assert!(html.contains("https://far.example.com"), "the link still works: {html}");
+    }
+
+    #[test]
+    fn peer_text_is_escaped() {
+        let mut out = output_with(Vec::new());
+        out.peers = vec![Peer {
+            desc: Some(r#""><script>alert(1)</script>"#.into()),
+            ..peer("xss", "http://ginger.local:6420")
+        }];
+        let html = render_peers(&out, true);
+        assert!(!html.contains("<script>"), "a peer description must not inject markup: {html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn the_machines_section_lands_in_the_generated_page() {
+        let mut out = output_with(vec![svc("Ollama", Some("11434"), "Host Services")]);
+        out.output_dir = std::env::temp_dir().join("splash-machines-test");
+        std::fs::create_dir_all(&out.output_dir).unwrap();
+        out.peers = vec![peer("ginger", "http://ginger.local:6420")];
+
+        let path = generate(&out).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.contains("Machines"), "the slot must be filled: {path}");
+        assert!(html.contains(r#"href="http://ginger.local:6420""#), "{path}");
+        assert!(!html.contains("<!-- PEERS -->"), "the slot itself must be gone: {path}");
+
+        let json = std::fs::read_to_string(out.output_dir.join("dashboard.json")).unwrap();
+        assert!(json.contains(r#""peers""#), "peers are machine-readable too: {json}");
+        assert!(json.contains("ginger.local:6420"), "{json}");
+
+        std::fs::remove_dir_all(&out.output_dir).ok();
     }
 
     #[test]

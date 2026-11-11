@@ -41,6 +41,38 @@ pub(crate) struct SplashConfig {
     /// Hand-written curation rules. See `splash --scaffold`.
     #[serde(default)]
     pub overrides_file: Option<String>,
+    /// Other machines running server-splash, listed on this machine's page. Defaults
+    /// to `peers.toml` next to this config file.
+    #[serde(default)]
+    pub peers_file: Option<String>,
+    /// Find and announce dashboards on the local network over mDNS. On by default:
+    /// a dashboard whose whole point is "click around the LAN" that must be listed by
+    /// hand first is a worse default. Announces only the hostname, title and version.
+    #[serde(default)]
+    pub lan: Option<bool>,
+    /// Announce this dashboard over mDNS. Only has an effect while serving, since a
+    /// one-shot process has no page to point at once it exits.
+    #[serde(default)]
+    pub lan_announce: Option<bool>,
+    /// How long a one-shot run listens for peers before generating. `--serve` does not
+    /// wait: it browses continuously and picks up whatever answered last time.
+    #[serde(default)]
+    pub lan_listen_secs: Option<u64>,
+    /// Forget a peer that has not announced itself for this long.
+    #[serde(default)]
+    pub peer_ttl_secs: Option<u64>,
+    /// Ask the peers in `peers.toml` for *their* list, so a fleet reachable only over
+    /// HTTP (WAN, another subnet) still fills in.
+    #[serde(default)]
+    pub federation: Option<bool>,
+    /// Publish this dashboard's own peer list at `/peers.json`. Turn it off to keep the
+    /// machines you know private when the page is reachable from the internet.
+    #[serde(default)]
+    pub publish_peers: Option<bool>,
+    /// How long a machine the page remembers stays worth trying. The memory lives in the
+    /// page itself (`<!-- CACHE … -->`), so there is no file to configure. `0` disables it.
+    #[serde(default)]
+    pub peer_cache_days: Option<u64>,
     #[serde(default)]
     pub glances_api_base: Option<String>,
     /// Appended to a bare hostname so links resolve from a browser: `ginger` ->
@@ -120,6 +152,14 @@ impl Default for SplashConfig {
             deploy_path: None,
             gui_pairs_file: None,
             overrides_file: None,
+            peers_file: None,
+            lan: None,
+            lan_announce: None,
+            lan_listen_secs: None,
+            peer_ttl_secs: None,
+            federation: None,
+            publish_peers: None,
+            peer_cache_days: None,
             glances_api_base: None,
             host_suffix: None,
             title: None,
@@ -190,6 +230,42 @@ impl SplashConfig {
         self.output_dir.clone().unwrap_or_else(|| default.to_string())
     }
 
+    /// Whether to discover peers over mDNS at all.
+    pub(crate) fn lan_enabled(&self) -> bool {
+        self.lan.unwrap_or(true)
+    }
+
+    /// Whether this dashboard announces itself. Announcing is what makes everything
+    /// work for everyone else, so it defaults on.
+    pub(crate) fn lan_announce(&self) -> bool {
+        self.lan_announce.unwrap_or(true)
+    }
+
+    /// How long a one-shot run listens before generating.
+    pub(crate) fn lan_listen_secs(&self) -> u64 {
+        self.lan_listen_secs.unwrap_or(2)
+    }
+
+    /// How long a quiet peer stays on the page.
+    pub(crate) fn peer_ttl_secs(&self) -> u64 {
+        self.peer_ttl_secs.unwrap_or(900)
+    }
+
+    /// Whether to learn peers from the ones already configured.
+    pub(crate) fn federation_enabled(&self) -> bool {
+        self.federation.unwrap_or(true)
+    }
+
+    /// Whether to serve `/peers.json`.
+    pub(crate) fn publish_peers(&self) -> bool {
+        self.publish_peers.unwrap_or(true)
+    }
+
+    /// How long a remembered address stays worth trying. 0 turns the cache off.
+    pub(crate) fn peer_cache_days(&self) -> u64 {
+        self.peer_cache_days.unwrap_or(30)
+    }
+
     /// Suffix appended to a bare hostname. Defaults to `.local` (mDNS).
     pub(crate) fn host_suffix(&self) -> String {
         self.host_suffix.clone().unwrap_or_else(|| ".local".to_string())
@@ -216,6 +292,20 @@ impl SplashConfig {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| config_dir().join("overrides.toml"))
+    }
+
+    /// Where the list of other splash machines lives.
+    ///
+    /// Kept separate from this config file on purpose: the interactive wizard rewrites
+    /// `splash-config.toml`, and a peer list must not be collateral damage of changing
+    /// the refresh interval.
+    pub(crate) fn get_peers_path(&self) -> PathBuf {
+        self.peers_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_dir().join("peers.toml"))
     }
 
     pub(crate) fn include_loopback(&self) -> bool {
@@ -362,6 +452,7 @@ impl SplashConfig {
         set!(model, "SPLASH_MODEL");
         set!(glances_api_base, "SPLASH_GLANCES");
         set!(overrides_file, "SPLASH_OVERRIDES");
+        set!(peers_file, "SPLASH_PEERS");
         set!(backup_dir, "SPLASH_BACKUP_DIR");
 
         // `agent_url` is a plain String rather than an Option, so it is not a `set!`.
@@ -373,6 +464,13 @@ impl SplashConfig {
         if let Some(v) = env_bool(get, "SPLASH_PROBE_HTTP") { self.probe_http = Some(v); }
         if let Some(v) = env_bool(get, "SPLASH_INLINE_ICONS") { self.inline_icons = Some(v); }
         if let Some(v) = env_bool(get, "SPLASH_NO_BACKUP") { self.no_backup = Some(v); }
+        if let Some(v) = env_bool(get, "SPLASH_LAN") { self.lan = Some(v); }
+        if let Some(v) = env_bool(get, "SPLASH_LAN_ANNOUNCE") { self.lan_announce = Some(v); }
+        if let Some(v) = env_bool(get, "SPLASH_FEDERATION") { self.federation = Some(v); }
+        if let Some(v) = env_bool(get, "SPLASH_PUBLISH_PEERS") { self.publish_peers = Some(v); }
+        if let Some(v) = env_num::<u64>(get, "SPLASH_LAN_LISTEN") { self.lan_listen_secs = Some(v); }
+        if let Some(v) = env_num::<u64>(get, "SPLASH_PEER_TTL") { self.peer_ttl_secs = Some(v); }
+        if let Some(v) = env_num::<u64>(get, "SPLASH_PEER_CACHE_DAYS") { self.peer_cache_days = Some(v); }
 
         if let Some(v) = env_port_list(get, "SPLASH_EXCLUDE_PORTS") { self.exclude_ports = Some(v); }
         if let Some(v) = env_num::<u64>(get, "SPLASH_HTTP_TIMEOUT_MS") { self.http_timeout_ms = Some(v); }
@@ -409,6 +507,11 @@ mod tests {
         assert_eq!(SplashConfig { speedtest_bytes: Some(0), ..SplashConfig::default() }.speedtest_bytes(), 0);
         assert!(c.backup_dir().is_some(), "backups are on by default");
         assert!(!c.backup_dir().unwrap().starts_with("/var/www"), "backups must not land in a web root");
+        assert!(
+            c.get_peers_path().ends_with("server-splash/peers.toml"),
+            "the peer list sits next to the config file: {:?}",
+            c.get_peers_path()
+        );
     }
 
     /// Build a lookup over a fixed set of pairs.
@@ -433,6 +536,7 @@ mod tests {
             ("SPLASH_SPEEDTEST_BYTES", "0"),
             ("SPLASH_TITLE", "Home Server"),
             ("SPLASH_MODULES", "Ollama Dashboard, Another"),
+            ("SPLASH_PEERS", "/srv/peers.toml"),
         ];
         let mut cfg = SplashConfig::default();
         cfg.apply_env_from(&env_from(&vars));
@@ -449,6 +553,7 @@ mod tests {
         assert_eq!(cfg.speedtest_bytes(), 0);
         assert_eq!(cfg.get_title("ignored"), "Home Server");
         assert_eq!(cfg.selected_modules(), vec!["Ollama Dashboard", "Another"]);
+        assert_eq!(cfg.get_peers_path(), PathBuf::from("/srv/peers.toml"));
     }
 
     #[test]
@@ -519,13 +624,33 @@ glances_api_base = "http://localhost:61208"
     }
 
     #[test]
+    fn the_page_memory_has_a_default_lifetime() {
+        let c = SplashConfig::default();
+        assert_eq!(c.peer_cache_days(), 30, "a remembered address is forgotten eventually");
+
+        let off = SplashConfig { peer_cache_days: Some(0), ..SplashConfig::default() };
+        assert_eq!(off.peer_cache_days(), 0, "0 disables the memory");
+
+        let vars = [("SPLASH_PEER_CACHE_DAYS", "7")];
+        let mut cfg = SplashConfig::default();
+        cfg.apply_env_from(&env_from(&vars));
+        assert_eq!(cfg.peer_cache_days(), 7);
+    }
+
+    #[test]
     fn blank_strings_fall_back_to_defaults() {
         let c = SplashConfig {
             output_file: Some("   ".into()),
             title: Some(String::new()),
+            peers_file: Some("  ".into()),
             ..SplashConfig::default()
         };
         assert_eq!(c.get_output_file(), "index.html");
         assert_eq!(c.get_title("ginger.local"), "ginger.local");
+        assert_eq!(
+            c.get_peers_path(),
+            config_dir().join("peers.toml"),
+            "a blank path must not become the working directory"
+        );
     }
 }

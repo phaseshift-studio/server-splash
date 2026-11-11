@@ -4,6 +4,8 @@ use dialoguer::Input;
 use atty::Stream;
 use unicode_width::UnicodeWidthChar;
 
+use crate::config::SplashConfig;
+
 /// ANSI color helpers — produces colored output on TTYs, plain text otherwise.
 fn bold_yellow(s: &str) -> String { format!("\x1b[1;33m{}\x1b[0m", s) }
 fn bold_green(s: &str) -> String { format!("\x1b[1;32m{}\x1b[0m", s) }
@@ -238,6 +240,14 @@ pub(crate) struct WizardOutput {
     pub overrides_path: PathBuf,
     /// Embed icons in the page as data URIs instead of writing `icons/` files.
     pub inline_icons: bool,
+    /// Other machines running server-splash, rendered as their own section so this
+    /// dashboard can be used to walk around the fleet instead of retyping URLs.
+    pub peers: Vec<crate::peers::Peer>,
+    /// Serve `/peers.json` so other dashboards can learn these machines.
+    pub publish_peers: bool,
+    /// The machines this page will remember, written into it as `<!-- CACHE … -->` and
+    /// read back by the next generation.
+    pub cache: Vec<crate::peers::Peer>,
 }
 
 /// Wrap text into lines of given width. Returns wrapped lines.
@@ -504,6 +514,7 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
                 let _ = std::fs::write(&state_path, json);
             }
 
+            let cache = remembered_in(&user_input_dir, config);
             return Ok(WizardOutput {
                 output_dir: PathBuf::from(user_input_dir),
                 output_file: config.get_output_file(),
@@ -523,6 +534,9 @@ pub(crate) fn run(config: &crate::config::SplashConfig) -> anyhow::Result<Wizard
                 speedtest_bytes: config.speedtest_bytes(),
                 overrides_path: config.get_overrides_path(),
                 inline_icons: config.inline_icons(),
+                peers: crate::peers::load(&config.get_peers_path(), &config.host_suffix()),
+                publish_peers: config.publish_peers(),
+                cache,
             });
         }
     }
@@ -983,6 +997,7 @@ fn curate_and_finish(
         None
     };
 
+    let cache = remembered_in(&user_input_dir, config);
     Ok(WizardOutput {
         output_dir: PathBuf::from(user_input_dir),
         output_file: config.get_output_file(),
@@ -1002,7 +1017,22 @@ fn curate_and_finish(
         speedtest_bytes: config.speedtest_bytes(),
         overrides_path: config.get_overrides_path(),
         inline_icons: config.inline_icons(),
+        peers: crate::peers::load(&config.get_peers_path(), &config.host_suffix()),
+        publish_peers: config.publish_peers(),
+        cache,
     })
+}
+
+/// What the page being replaced remembers, so an interactive regeneration does not
+/// silently forget the machines it had found.
+fn remembered_in(output_dir: &str, config: &SplashConfig) -> Vec<crate::peers::Peer> {
+    let days = config.peer_cache_days();
+    if days == 0 {
+        return Vec::new();
+    }
+    let max_age = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let page = PathBuf::from(output_dir).join(config.get_output_file());
+    crate::cache::read(&page, max_age)
 }
 
 /// Build an HTTP probe URL for a service. Returns None for non-HTTP services.

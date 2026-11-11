@@ -207,6 +207,19 @@ mod tests {
     }
 
     #[test]
+    fn serves_the_files_peers_read() {
+        let root = Path::new("/srv/www");
+        // The peer endpoints are plain files in the document root, so they work whether
+        // the page is served by this binary or by nginx.
+        assert_eq!(
+            resolve(root, "/.well-known/splash.json").unwrap(),
+            PathBuf::from("/srv/www/.well-known/splash.json")
+        );
+        assert_eq!(resolve(root, "/peers.json").unwrap(), PathBuf::from("/srv/www/peers.json"));
+        assert_eq!(content_type(Path::new("splash.json")), "application/json");
+    }
+
+    #[test]
     fn refuses_to_escape_the_document_root() {
         let root = Path::new("/srv/www");
         assert!(resolve(root, "/../../etc/shadow").is_none(), "traversal must be refused");

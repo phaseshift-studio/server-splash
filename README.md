@@ -144,6 +144,14 @@ These exist so a container needs no config file — see `docker-compose.yml`.
 | `SPLASH_INLINE_ICONS` | `true` | Embed icons in the page rather than writing `icons/`. |
 | `SPLASH_MODULES` | – | Sub-dashboards to build: `"Ollama Dashboard"`, `"systemd"`, `"cron"`. |
 | `SPLASH_OVERRIDES` | `~/.config/server-splash/overrides.toml` | Curation rules. |
+| `SPLASH_PEERS` | `~/.config/server-splash/peers.toml` | Other splash machines to link. |
+| `SPLASH_LAN` | `true` | Find and announce dashboards over mDNS. |
+| `SPLASH_LAN_ANNOUNCE` | `true` | Announce this dashboard over mDNS (only while serving). |
+| `SPLASH_LAN_LISTEN` | `2` | Seconds a one-shot run listens for peers. `0` skips the wait. |
+| `SPLASH_PEER_TTL` | `900` | Forget a peer not announced for this many seconds. |
+| `SPLASH_FEDERATION` | `true` | Learn peers from the peers in `peers.toml`. |
+| `SPLASH_PUBLISH_PEERS` | `true` | Serve `/peers.json` so others can learn from you. |
+| `SPLASH_PEER_CACHE_DAYS` | `30` | How long the page remembers a machine; `0` disables. |
 | `SPLASH_OUTPUT_DIR` | `./server-splash` | Where the page is written. |
 | `SPLASH_BACKUP_DIR` | `~/.local/share/server-splash/backups` | Pre-deploy backups. |
 
@@ -165,6 +173,13 @@ deploy_path = "/var/www/html"
 glances_api_base = "http://ginger.local:61208"
 exclude_ports = [80]
 title = "Home Server"
+
+# Other dashboards: the manual list, and the two ways to fill it in.
+peers_file = "/etc/server-splash/peers.toml"
+lan = true               # mDNS discovery (announce + browse)
+federation = true        # learn from the peers in peers.toml
+publish_peers = true     # serve /peers.json -- false on a public host
+peer_cache_days = 30     # remember addresses this long, for a run that finds nothing
 ```
 
 ### Curating the result
@@ -197,6 +212,165 @@ hidden = true
 ```
 
 `icon` may be an emoji, an image path (`icons/my-logo.png`) or a URL.
+
+### Linking other machines
+
+One page describes one host. `peers.toml` turns a rack of them into something you can
+walk around with the mouse instead of the address bar: every entry becomes a card in a
+**Machines** section at the top of the page, and clicking one loads *that* machine's
+dashboard, which links to the rest in turn.
+
+```bash
+splash --scaffold-peers     # write a documented starter file, then edit it
+```
+
+```toml
+# ~/.config/server-splash/peers.toml
+[[peer]]
+name  = "ginger"
+url   = "ginger.local:6420"
+desc  = "Dual RTX 3090 — media + GPUs"
+icon  = "🫚"
+group = "LAN"
+
+[[peer]]
+name  = "basil"
+url   = "https://basil.example.com"     # WAN: a full https URL, no port needed
+desc  = "Colo VPS — always on"
+group = "WAN"
+
+[[peer]]
+name   = "old-thinkpad"
+url    = "192.168.1.50:6420"
+hidden = true                           # kept in the file, off the page
+```
+
+| Field | What it does |
+| --- | --- |
+| `name` | Card title. Required — a peer without one is skipped with a warning. |
+| `url` | Where its splash page lives. Required. See the forms below. |
+| `desc` | One line under the name. Defaults to the URL's host. |
+| `icon` | Emoji, an image path, or an absolute URL. Defaults to 🖥️. |
+| `group` | Small tag on the card, e.g. `LAN` / `WAN`. Purely presentational. |
+| `hidden` | Keep the entry, leave it off the page. |
+| `probe` | Set `false` to drop the live status light for a slow or remote host. |
+
+`url` accepts a full address — the only way to reach a host behind a reverse proxy or
+on another network — or a bare host, which gets `http://` and the same `.local` suffix
+as service links:
+
+| Written | Becomes |
+| --- | --- |
+| `ginger` | `http://ginger.local` |
+| `ginger:6420` | `http://ginger.local:6420` |
+| `192.168.1.50:6420` | `http://192.168.1.50:6420` |
+| `https://basil.example.com` | unchanged |
+
+The status light is the browser asking the other machine whether it answers, so the
+page tells you a box is down before you click it. Two consequences worth knowing:
+
+- A page served over **https** cannot probe an **http** peer — the browser blocks
+  mixed content, so the light stays red even though the link works by hand. Give WAN
+  peers an `https://` URL.
+- Peers are read at generation time, like everything else, so an edit takes effect on
+  the next refresh (`--serve` regenerates on its interval).
+
+`--peers <FILE>` and `SPLASH_PEERS` override the path, so a whole fleet can share one
+list from a mounted file or a config repo.
+
+### Finding the other machines automatically
+
+Writing the list by hand is fine for a rack you rarely touch. For the rest, two
+mechanisms fill the **Machines** row in without anybody typing a hostname, and they
+cover different halves of the problem.
+
+**On one network segment: mDNS.** While serving, the dashboard registers
+`_splash._tcp.local` and browses for the same type — the mechanism printers, Chromecast
+and Home Assistant have used for years. Every dashboard it hears becomes a card tagged
+`discovered`, within a couple of seconds of starting. Nothing to configure and nothing
+to maintain; a machine that shuts down disappears when it says goodbye, or after
+`SPLASH_PEER_TTL` if the cable was pulled.
+
+It has to happen in the `splash` process, not the page: browsers have no mDNS API and
+cannot multicast, which is why a static page can never find another page. So a
+long-running `--serve` gets live discovery, and a one-shot `--auto` listens for
+`SPLASH_LAN_LISTEN` seconds (2, settable to 0) before generating.
+
+Two limits worth knowing: mDNS does not cross a router, a VLAN boundary or most VPNs
+(that is what federation is for), and the container already needs `network_mode: host`
+for socket discovery — the same requirement makes mDNS work.
+
+**Across networks: federation.** Any dashboard can be asked for its peer list at
+`/peers.json`, which carries the machines its owner wrote into `peers.toml`. So the
+machines you already configured become seeds: each refresh asks them what they know,
+and whatever comes back is shown tagged `via ginger.local`. Over plain HTTPS, so it
+works for a colo box, another subnet, or a VPN peer.
+
+Federation is deliberately one hop each way:
+
+- only machines **in `peers.toml`** are fetched from — something discovered over mDNS
+  is never used as a seed, so learning cannot chase its own tail;
+- only machines **in `peers.toml`** are republished — so ginger teaches you about
+  basil, but nothing you merely heard about leaves your machine.
+
+What a dashboard publishes and what is therefore visible:
+
+| URL | Contents |
+| --- | --- |
+| `/peers.json` | The machines in your `peers.toml`, nothing else. |
+| `/.well-known/splash.json` | Its identity: name, title, version, build. |
+
+Neither file lists a service or a port. That is the same rule that keeps
+`dashboard.json` out of every deploy: an announcement should not be an inventory.
+
+> **If this page is on the public internet**, `/peers.json` names your other machines.
+> Set `advertise = false` on a peer you would rather not publish, or
+> `publish_peers = false` to serve no list at all. Discovery is read-only and
+> unauthenticated in both directions: anyone who can reach the page can read the list,
+> and anyone can claim a `_splash._tcp.local` name on your LAN.
+
+Turn the automation off with `--no-lan` (no mDNS at all), `--no-announce` (find others,
+stay invisible yourself), `--no-federation` (don't ask peers for theirs), or
+`publish_peers = false`. Run `splash --auto --no-lan` in a network you don't control.
+
+Spell a peer by hostname rather than by IP where you can (`ginger.local:6420`): the
+mDNS announcement uses the hostname, so the two collapse into a single card. A peer
+written as an IP is matched against the addresses the machine announced, so it usually
+collapses too — but the hostname is exact.
+
+**Every generation also retries the machines it remembers.** The page carries its own
+memory, in a comment at the end of itself — no cache file, no cache directory, nothing to
+clean up:
+
+```html
+<!-- CACHE {"peers":[{"name":"bravo.local","url":"http://bravo.local:6422","last_seen":1794366784}]} -->
+```
+
+The next run reads that back out of the page it is about to replace, then asks those
+addresses whether they are still there:
+
+```
+remembered 1 machine(s) from what this page kept
+```
+
+A remembered machine is shown with its age (`last seen 3h ago`) and a status light that says
+whether it answered just now — and it doubles as a federation seed, so one machine that came
+back can pull the rest of the list in with it. That is what keeps the page useful on a
+network where multicast is filtered, or on a morning when every configured peer is asleep.
+
+Three properties keep this from becoming a source of fiction:
+
+- a remembered entry never displaces a machine discovered live — the live spelling wins;
+- it is **never republished** in `/peers.json`, so remembering a machine cannot put it into
+  your published topology;
+- entries expire after `SPLASH_PEER_CACHE_DAYS` (30), and a machine that answers keeps its
+  timestamp fresh.
+
+Because the memory *is* the page, regenerating into a different output directory starts from
+nothing — unless `--deploy` is set, in which case the last deployed page is read instead.
+**Deleting the page forgets the machines**, which is the opt-out; `peer_cache_days = 0`
+turns the memory off entirely. Note that the comment is part of the HTML: anyone who can
+read the page can read the last-seen addresses in it.
 
 ---
 
@@ -300,7 +474,7 @@ authoring a sub-dashboard module — is in [docs/DESIGN.md](docs/DESIGN.md).
 ## Development
 
 ```bash
-cargo test                        # 80+ tests, no network or daemons required
+cargo test                        # 150+ tests, no network or daemons required
 cargo clippy --all-targets
 cargo run -- --auto --no-agent --output /tmp/preview
 ```

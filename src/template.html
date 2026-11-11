@@ -71,6 +71,13 @@
   .toolbar button:disabled { opacity: .45; cursor: default; }
   .toolbar button { background: #1e2030; border: 1px solid #292e42; color: #7aa2f7; border-radius: 5px; padding: .3rem .7rem; font-size: .72rem; cursor: pointer; font-family: inherit; }
   .toolbar button:hover { border-color: #7aa2f7; color: #b9f27c; }
+
+  /* other machines running server-splash */
+  .card.peer { border-left: 3px solid #7aa2f7; }
+  .card.peer:hover { border-left-color: #b9f27c; }
+  .peer-tag { background: #292e42; color: #7aa2f7; border-radius: 3px; padding: .1rem .35rem;
+              font-size: .62rem; text-transform: uppercase; letter-spacing: .06em;
+              margin-right: .45rem; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -89,6 +96,8 @@
   <button id="refresh" type="button">Re-check status</button>
   <button id="resync" type="button">Resync with server</button>
 </div>
+
+<!-- PEERS -->
 
 <!-- GPU_SECTION -->
 
@@ -420,5 +429,7 @@ renderSystem();
 setInterval(renderSystem, 3000);
 setInterval(refreshStatus, 30000);
 </script>
+
+<!-- CACHE -->
 </body>
 </html>

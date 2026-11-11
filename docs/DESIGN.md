@@ -53,6 +53,88 @@ name for a service nothing recognises. The same response body is scanned for
 
 Ports that never answer are still listed, as `tcp` services with no link.
 
+## Peer discovery
+
+The page describes one host, so linking to another host means learning its address. Three
+sources feed the **Machines** row, and each only contributes machines the previous one did
+not already name:
+
+1. **`peers.toml`** — authoritative, works across any network, and the only source whose
+   entries are ever republished.
+2. **mDNS** — `_splash._tcp.local`, announced and browsed by the daemon.
+3. **Federation** — `GET /peers.json` from the machines in `peers.toml`.
+
+### Why discovery cannot happen in the page
+
+A browser has no mDNS API and cannot send multicast, so a static page can never find a
+sibling page. Discovery therefore runs in the `splash` process and is baked into the next
+generation. That shapes the modes: `--serve` is long-lived, so it announces and browses
+continuously; a one-shot `--auto` listens for `lan_listen_secs` and announces nothing,
+because a service name that outlives the process by milliseconds points other dashboards
+at a dead record.
+
+The first paint of `--serve` deliberately skips both the listen and the federation pull.
+The page is useful in about a second, and the worker refreshes two seconds later with the
+machines it found.
+
+### Two rules that bound the flood
+
+- **Seeds are configured, not discovered.** A machine heard over mDNS is never fetched
+  from, so learning cannot chase its own tail around the network.
+- **Only configured machines are republished.** What federation brings in is shown and
+  stops there. That bounds propagation to one hop — ginger teaches you about basil, and
+  basil learns nothing about carol through you — and keeps a LAN's machine names off a WAN
+  host by accident.
+
+`/peers.json` and `/.well-known/splash.json` list machines and identity (name, title,
+version, build). Neither lists a service or a port, for the same reason `dashboard.json` is
+never deployed: an announcement should not be an inventory. Both are written as files, so
+they exist whether the page is served by this binary or by nginx.
+
+### Remembered addresses
+
+Discovery is only as good as the network, so the page remembers what it found **in itself**:
+a single `<!-- CACHE {…} -->` comment at the end of the document. The next generation reads
+it out of the page it is about to replace and tries those addresses.
+
+Putting the memory in the page rather than in a file is a deliberate simplification: there is
+no cache directory to create, no permissions to get right, no state file to exclude from a
+deploy, and no cleanup. The artefact and its memory are one object, and it travels with the
+page — a machine that generates into a temporary directory and copies the result still
+remembers, because the deployed page is read as a fallback when the output page has no
+memory yet. Deleting the page is the way to forget.
+
+Consequences worth stating:
+
+- the memory is read every run and **tried**: remembered addresses are fetched like
+  configured ones, so each proves it is there and may hand back more of the fleet.
+- both directions are bounded as before — remembered addresses are seeds, and only
+  `peers.toml` entries are republished, so a machine cannot enter the published topology by
+  being remembered.
+- entries carry `last_seen`; a machine that answers is refreshed, one that does not keeps
+  its age and expires after `peer_cache_days`.
+- `--` inside the JSON is written as `-\u002d`. A JSON string is the only place two hyphens
+  can occur, and an unescaped `-->` in a peer description would end the comment early and
+  dump the memory into the document as visible text.
+- the comment is public HTML: it lists the machines this dashboard has seen. That is the
+  same information the Machines row shows, plus timestamps.
+
+### Failure modes
+
+- mDNS is layer 2. It does not cross a router, a VLAN boundary, or most VPNs — that is
+  what federation is for. Networks that filter multicast are covered by federation too, as
+  long as one reachable peer is listed.
+- The link is written as `http://<hostname>:<port>` and resolved by the *browser*, so the
+  viewer needs mDNS name resolution (Windows 10+, macOS, systemd-resolved with nss-mdns).
+  The same requirement already applies to every service link on the page.
+- A machine's mDNS answer carries every address it has, including `docker0` and Tailscale
+  ranges, so the hostname is preferred over the resolved IP: a link to the wrong address
+  fails in a way nobody can debug from the card.
+- Our own announcement comes back through the browse, so results are filtered against
+  `(hostname, port)`. Without that the page offers a card linking to itself.
+- Deduplication is by hostname and by the addresses a machine announced, so an entry
+  written as an IP and the same machine announcing a hostname collapse into one card.
+
 ## Naming
 
 Resolved in this order; first answer wins:
