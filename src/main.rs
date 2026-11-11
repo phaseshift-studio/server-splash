@@ -11,13 +11,13 @@ mod peers;
 mod lan;
 mod federation;
 mod cache;
+mod live;
 
 use std::path::{Path, PathBuf};
 
 use catalog::Catalog;
 use config::SplashConfig;
 use discover::Discovery;
-use peers::Peer;
 use wizard::{SplashService, WizardOutput};
 
 const USAGE: &str = "\
@@ -411,120 +411,37 @@ fn run_auto(cfg: &SplashConfig, peers_ctx: PeerContext<'_>) -> Result<WizardOutp
     let glances_api_base = resolve_glances(cfg, &discovery, &hostname);
     let title = cfg.get_title(&hostname);
 
-    // Other splash machines. Four sources, merged in this order so the nearest wins:
-    // the hand-written list, whoever is announcing itself on this network, what earlier
-    // runs remember, and finally what a reachable peer told us about.
-    let mut peers = peers::load(&cfg.get_peers_path(), &cfg.host_suffix());
-    let configured_peers = peers.clone();
-    let configured = configured_peers.len();
+    // Other splash machines. Assembled in one place (`live`) because the Resync button
+    // asks the same question of the same server and must not get a different answer.
+    let collected = live::collect(cfg, peers_ctx.lan, &hostname, peers_ctx.federated);
+    let peers = collected.cards;
+    let cache_entries = collected.memory;
     let shown = peers.iter().filter(|p| !p.is_hidden()).count();
-    if configured > 0 {
+
+    if collected.configured > 0 {
         eprintln!(
             "  linking \x1b[1;32m{shown}\x1b[0m peer machine(s) from {}",
             cfg.get_peers_path().display()
         );
     }
-
-    // Everything this run learned from the network, so it can be remembered for next time.
-    let mut observed: Vec<Peer> = Vec::new();
-
-    if let Some(lan) = peers_ctx.lan {
-        // Our own announcement comes back through the same browse, so a dashboard that
-        // did not filter itself would offer a card linking to the page you are on.
-        let heard: Vec<_> = lan
-            .peers(std::time::Duration::from_secs(cfg.peer_ttl_secs()))
-            .into_iter()
-            .filter(|p| !peers::is_self(&p.url, &hostname, cfg.serve_port()))
-            .collect();
-        observed.extend(heard.iter().cloned());
-        let before = peers.len();
-        peers = peers::merge(peers, heard);
-        let found = peers.len() - before;
-        if found > 0 {
-            eprintln!("  discovered \x1b[1;32m{found}\x1b[0m new dashboard(s) announcing on the LAN");
-        }
-    }
-
-    // The page remembers the machines it found, in a comment at the end of itself. Read it
-    // back on every run — not only when the network fails — because a machine that was
-    // here last week is worth one cheap request. Deleting the page forgets them.
-    let cache_days = cfg.peer_cache_days();
-    let cache_max_age = std::time::Duration::from_secs(cache_days.saturating_mul(86_400));
-    let hints: Vec<Peer> = if cache_days > 0 {
-        let output_dir = PathBuf::from(cfg.get_output_dir("./server-splash"));
-        let mut memory = cache::read(&output_dir.join(cfg.get_output_file()), cache_max_age);
-        if memory.is_empty() {
-            // Generating into a scratch directory and deploying elsewhere is a supported
-            // shape; the last deployed page carries the memory in that case.
-            if let Some(deploy) = cfg.deploy_path.as_deref().filter(|d| !d.trim().is_empty()) {
-                memory = cache::read(&Path::new(deploy).join(cfg.get_output_file()), cache_max_age);
-            }
-        }
-        // Filtered like every other source: a page written under a different hostname must
-        // not offer a card to itself.
-        memory
-            .into_iter()
-            .filter(|p| !peers::is_self(&p.url, &hostname, cfg.serve_port()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Seeds are what we can meaningfully ask: the configured machines and the remembered
-    // ones. A machine currently announcing itself is already here and is not asked, so it
-    // must not be in this list — it would be marked down without anybody trying it.
-    let seeds = peers::merge(configured_peers, hints.clone());
-    let federating = peers_ctx.federated && cfg.federation_enabled();
-    let pulled = if federating {
-        federation::pull(
-            &seeds,
-            &cfg.host_suffix(),
-            &hostname,
-            cfg.serve_port(),
-            std::time::Duration::from_millis(cfg.http_timeout_ms()),
-        )
-    } else {
-        federation::Pulled::default()
-    };
-
-    let before = peers.len();
-    peers = peers::merge(peers, hints.clone());
-    let remembered = peers.len() - before;
-    if remembered > 0 {
+    if collected.discovered > 0 {
         eprintln!(
-            "  remembered \x1b[1;32m{remembered}\x1b[0m machine(s) from what this page kept"
+            "  discovered \x1b[1;32m{}\x1b[0m new dashboard(s) announcing on the LAN",
+            collected.discovered
         );
     }
-
-    let before = peers.len();
-    peers = peers::merge(peers, pulled.learned.clone());
-    let learned_now = peers.len() - before;
-    if learned_now > 0 {
-        eprintln!("  learned \x1b[1;32m{learned_now}\x1b[0m more machine(s) from the peers we could reach");
+    if collected.remembered > 0 {
+        eprintln!(
+            "  remembered \x1b[1;32m{}\x1b[0m machine(s) from what this page kept",
+            collected.remembered
+        );
     }
-
-    // Did the machine answer? Recorded so the page shows it before any script runs; a
-    // card nobody asked about stays unknown and the browser decides.
-    if federating {
-        mark_reachability(&mut peers, &seeds, &pulled.answered);
+    if collected.learned > 0 {
+        eprintln!(
+            "  learned \x1b[1;32m{}\x1b[0m more machine(s) from the peers we could reach",
+            collected.learned
+        );
     }
-
-    // Fold this run's findings into the memory that goes into the new page. Configured
-    // machines are never remembered: they are already in `peers.toml`, and removing one
-    // from there should be the end of it.
-    observed.extend(pulled.learned.iter().cloned());
-    observed.extend(
-        pulled
-            .answered
-            .iter()
-            .filter(|p| p.source.as_deref() == Some(peers::SOURCE_CACHE))
-            .cloned(),
-    );
-    let cache_entries = if cache_days > 0 {
-        cache::merge(&hints, &observed, cache_max_age)
-    } else {
-        Vec::new()
-    };
 
     Ok(WizardOutput {
         output_dir: PathBuf::from(cfg.get_output_dir("./server-splash")),
@@ -549,19 +466,6 @@ fn run_auto(cfg: &SplashConfig, peers_ctx: PeerContext<'_>) -> Result<WizardOutp
         publish_peers: cfg.publish_peers(),
         cache: cache_entries,
     })
-}
-
-/// Record, on each card we actually asked, whether the machine answered.
-///
-/// Only a configured or remembered machine is asked, so only those get a verdict; a card
-/// discovered over mDNS or learned from a peer keeps `None`, and the browser's probe fills
-/// it in.
-fn mark_reachability(peers: &mut [Peer], seeds: &[Peer], answered: &[Peer]) {
-    for peer in peers.iter_mut() {
-        if seeds.iter().any(|seed| peers::same_machine(seed, peer)) {
-            peer.alive = Some(answered.iter().any(|a| peers::same_machine(a, peer)));
-        }
-    }
 }
 
 /// Where the page should fetch GPU stats from.
@@ -753,6 +657,7 @@ fn run_serve(cfg: &SplashConfig, port: u16) -> Result<(), String> {
     // no mDNS wait: the page is useful about a second in either way.
     let out = run_auto(&fast, PeerContext::default())?;
     ensure_port_available(port, &out.selected_services)?;
+    let hostname = out.hostname.clone();
 
     // Join the LAN as soon as we know what to announce. Serving for a few minutes is
     // exactly the case mDNS is for, so this is where announcing belongs.
@@ -768,6 +673,10 @@ fn run_serve(cfg: &SplashConfig, port: u16) -> Result<(), String> {
     };
 
     generate_and_deploy(&fast, out)?;
+
+    // The Resync button asks this server who it can see *right now*, which is the only way
+    // to show peers found after the page was last generated.
+    let live = live::Context::new(cfg, lan.clone(), &hostname);
 
     let interval = cfg.interval_secs();
     if interval > 0 {
@@ -799,7 +708,7 @@ fn run_serve(cfg: &SplashConfig, port: u16) -> Result<(), String> {
         out_dir.display(),
         if interval > 0 { format!(" (refreshing every {interval}s)") } else { String::new() }
     );
-    server::serve(&out_dir, port)
+    server::serve(&out_dir, port, Some(live))
 }
 
 /// One regeneration, with failures reported rather than fatal.
@@ -1253,44 +1162,6 @@ mod tests {
         deploy(&src, &dst, None).unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("index.html")).unwrap(), "NEW");
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn only_asked_machines_get_a_reachability_verdict() {
-        let up = Peer {
-            name: "up".into(),
-            url: "http://up.local:6420".into(),
-            source: Some(peers::SOURCE_CONFIG.into()),
-            ..Peer::default()
-        };
-        let down = Peer {
-            name: "down".into(),
-            url: "http://down.local:6420".into(),
-            source: Some(peers::SOURCE_CONFIG.into()),
-            ..Peer::default()
-        };
-        let remembered = Peer {
-            name: "remembered".into(),
-            url: "http://remembered.local:6420".into(),
-            source: Some(peers::SOURCE_CACHE.into()),
-            ..Peer::default()
-        };
-        let heard = Peer {
-            name: "heard".into(),
-            url: "http://heard.local:6420".into(),
-            source: Some(peers::SOURCE_MDNS.into()),
-            ..Peer::default()
-        };
-
-        let seeds = vec![up.clone(), down.clone(), remembered.clone()];
-        let answered = vec![up.clone(), remembered.clone()];
-        let mut cards = vec![up, down, remembered, heard];
-        mark_reachability(&mut cards, &seeds, &answered);
-
-        assert_eq!(cards[0].alive, Some(true), "a seed that replied is up");
-        assert_eq!(cards[1].alive, Some(false), "a seed that did not reply is down");
-        assert_eq!(cards[2].alive, Some(true), "a remembered address that replied is up");
-        assert_eq!(cards[3].alive, None, "a machine nobody asked stays unknown");
     }
 
     #[test]

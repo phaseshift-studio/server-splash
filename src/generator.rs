@@ -316,7 +316,7 @@ fn render_groups(services: &[SplashService], hostname: &str, inline_icons: bool)
 /// Deliberately built from the same `.card` markup as a service card: the status
 /// light, the hover treatment and the health script come for free, and a machine you
 /// can click looks exactly like a service you can click.
-fn render_peer_card(peer: &Peer, inline_icons: bool) -> String {
+pub(crate) fn render_peer_card(peer: &Peer, inline_icons: bool) -> String {
     let icon = peer.icon_or_default();
     // Provenance beats a curated tag: a machine that arrived over federation must say so,
     // so it is never mistaken for one that is in `peers.toml`.
@@ -441,6 +441,9 @@ fn resync_config(output: &WizardOutput, hostname: &str) -> String {
     let catalog = crate::catalog::Catalog::load(&output.overrides_path);
     let payload = serde_json::json!({
         "host": hostname,
+        // Where the Resync button asks this server who it can see right now. Absent on a
+        // page served by anything other than `splash`, where the request just 404s.
+        "live": crate::live::LIVE_PATH,
         "knownPorts": known,
         "candidates": crate::catalog::RESYNC_CANDIDATE_PORTS,
         "catalog": catalog.port_index(),

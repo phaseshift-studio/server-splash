@@ -374,12 +374,81 @@ async function probePort(port) {
   }
 }
 
+// ─────────────────────────── machines ───────────────────────────
+// Peers are found by the server, not the browser: mDNS and the federation pull both run
+// there. Asking for them is therefore a request, and the answer is a list of cards
+// rendered by the same code that built this page — same tags, same escaping.
+function machinesGrid() {
+  const heading = Array.from(document.querySelectorAll('h2'))
+    .find(h => h.textContent.trim().toLowerCase().includes('machines'));
+  if (heading && heading.nextElementSibling && heading.nextElementSibling.classList.contains('grid')) {
+    return heading.nextElementSibling;
+  }
+  const h2 = document.createElement('h2');
+  h2.innerHTML = '&#x1F5A5;&#xFE0F; Machines';
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  const toolbar = document.querySelector('.toolbar');
+  if (toolbar) {
+    toolbar.after(h2);
+    h2.after(grid);
+  } else {
+    const footer = document.querySelector('footer');
+    footer.parentNode.insertBefore(h2, footer);
+    footer.parentNode.insertBefore(grid, footer);
+  }
+  return grid;
+}
+
+async function resyncPeers() {
+  const url = (SYSPLASH && SYSPLASH.live) || '';
+  if (!url) return 0;
+
+  let data;
+  try {
+    const resp = await fetch(url, { cache: 'no-store' });
+    if (!resp.ok) return 0;              // the page is served by another web server
+    data = await resp.json();
+  } catch (e) {
+    return 0;                            // older server, or offline
+  }
+  if (!data || data.generator !== 'server-splash') return 0;
+
+  const seen = new Set(
+    Array.from(document.querySelectorAll('a.card.peer')).map(a => a.getAttribute('href'))
+  );
+  const self = ((SYSPLASH && SYSPLASH.host) || '').toLowerCase();
+  let added = 0;
+
+  for (const card of data.cards || []) {
+    if (!card || !card.url || !card.html) continue;
+    if (seen.has(card.url)) continue;
+    // Never offer a card to the machine displaying the page.
+    try {
+      if (self && new URL(card.url).hostname.toLowerCase() === self) continue;
+    } catch (e) { /* a URL the browser cannot parse is not one to add */ }
+
+    const holder = document.createElement('div');
+    holder.innerHTML = card.html.trim();
+    const el = holder.firstElementChild;
+    if (!el) continue;
+    machinesGrid().appendChild(el);
+    seen.add(card.url);
+    probeCard(el);
+    added++;
+  }
+  return added;
+}
+
 async function resync() {
   if (!SYSPLASH || !SYSPLASH.host) { note('resync unavailable'); return; }
   const btn = document.getElementById('resync');
   btn.disabled = true;
 
   refreshStatus();
+
+  // Ask the server first: it may have found machines since this page was generated.
+  const machines = await resyncPeers();
 
   const known = new Set(SYSPLASH.knownPorts || []);
   document.querySelectorAll('.card[data-service]').forEach(card => {
@@ -414,9 +483,12 @@ async function resync() {
   }
 
   btn.disabled = false;
-  note(added === 0
-    ? 'no new services found in ' + todo.length + ' candidate ports'
-    : 'added ' + added + ' new service' + (added === 1 ? '' : 's'));
+  const bits = [];
+  if (added > 0) bits.push(added + ' new service' + (added === 1 ? '' : 's'));
+  if (machines > 0) bits.push(machines + ' machine' + (machines === 1 ? '' : 's'));
+  note(bits.length
+    ? 'added ' + bits.join(' and ')
+    : 'nothing new: ' + todo.length + ' ports probed');
 }
 
 document.getElementById('speedtest').addEventListener('click', runSpeedTest);

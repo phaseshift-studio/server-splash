@@ -13,8 +13,34 @@ use std::time::Duration;
 /// How long a client has to send its request before we give up on it.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where a request goes: one of this server's own endpoints, or a file under the root.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Route<'a> {
+    Health,
+    /// The live peer list behind the page's Resync button.
+    LivePeers,
+    File(&'a str),
+}
+
+/// Classify a request path. Split out from the request loop so it can be tested without a
+/// socket.
+pub(crate) fn route(path: &str) -> Route<'_> {
+    if path == "/healthz" {
+        return Route::Health;
+    }
+    if path == crate::live::LIVE_PATH {
+        return Route::LivePeers;
+    }
+    Route::File(path)
+}
+
 /// Serve `root` on `port` until the process is killed.
-pub(crate) fn serve(root: &Path, port: u16) -> Result<(), String> {
+///
+/// `live` is present when this binary is the one serving the page, and answers the peer
+/// endpoint the Resync button calls. When the page is deployed to another web server that
+/// endpoint does not exist there, and the button falls back to what the page was built
+/// with.
+pub(crate) fn serve(root: &Path, port: u16, live: Option<crate::live::Context>) -> Result<(), String> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .map_err(|e| format!("cannot listen on port {port}: {e}"))?;
 
@@ -22,10 +48,11 @@ pub(crate) fn serve(root: &Path, port: u16) -> Result<(), String> {
         match stream {
             Ok(stream) => {
                 let root = root.to_path_buf();
+                let live = live.clone();
                 // One thread per request: the traffic here is a browser and a few
                 // health checks, not a workload.
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(stream, &root) {
+                    if let Err(e) = handle(stream, &root, live.as_ref()) {
                         // A client that hangs up mid-response is routine, not an error
                         // worth printing on every page load.
                         let _ = e;
@@ -48,7 +75,7 @@ pub(crate) fn check(port: u16) -> bool {
     .is_ok()
 }
 
-fn handle(stream: TcpStream, root: &Path) -> std::io::Result<()> {
+fn handle(stream: TcpStream, root: &Path, live: Option<&crate::live::Context>) -> std::io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(READ_TIMEOUT))?;
 
@@ -74,20 +101,28 @@ fn handle(stream: TcpStream, root: &Path) -> std::io::Result<()> {
     }
 
     let path = target.split(['?', '#']).next().unwrap_or("/");
-    if path == "/healthz" {
-        return respond(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", method == "HEAD");
-    }
+    let head_only = method == "HEAD";
 
-    let Some(file) = resolve(root, path) else {
-        return respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad request", method == "HEAD");
-    };
-
-    match std::fs::read(&file) {
-        Ok(body) => {
-            let mime = content_type(&file);
-            respond(&mut stream, 200, mime, &body, method == "HEAD")
+    match route(path) {
+        Route::Health => respond(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", head_only),
+        Route::LivePeers => match live {
+            Some(live) => {
+                // Assembled per request, because the whole point is that it reflects the
+                // mDNS browse right now rather than at the last regeneration.
+                let body = live.peers_json();
+                respond(&mut stream, 200, "application/json", body.as_bytes(), head_only)
+            }
+            None => respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found", head_only),
+        },
+        Route::File(path) => {
+            let Some(file) = resolve(root, path) else {
+                return respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad request", head_only);
+            };
+            match std::fs::read(&file) {
+                Ok(body) => respond(&mut stream, 200, content_type(&file), &body, head_only),
+                Err(_) => respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found", head_only),
+            }
         }
-        Err(_) => respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found", method == "HEAD"),
     }
 }
 
@@ -204,6 +239,18 @@ mod tests {
         assert_eq!(resolve(root, "/preview/").unwrap(), PathBuf::from("/srv/www/preview/index.html"));
         assert_eq!(resolve(root, "/index.html").unwrap(), PathBuf::from("/srv/www/index.html"));
         assert_eq!(resolve(root, "/icons/metatron.png").unwrap(), PathBuf::from("/srv/www/icons/metatron.png"));
+    }
+
+    #[test]
+    fn routes_its_own_endpoints_before_the_document_root() {
+        assert_eq!(route("/healthz"), Route::Health);
+        assert_eq!(route("/_splash/peers"), Route::LivePeers);
+        // Everything else is a file, including paths that only look like endpoints.
+        assert_eq!(route("/"), Route::File("/"));
+        assert_eq!(route("/_splash/other"), Route::File("/_splash/other"));
+        assert_eq!(route("/peers.json"), Route::File("/peers.json"));
+        // Query strings are stripped before routing, so the cache-buster is harmless.
+        assert_eq!(route("/_splash/peers?cb=1"), Route::File("/_splash/peers?cb=1"));
     }
 
     #[test]

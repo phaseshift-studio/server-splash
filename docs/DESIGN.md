@@ -119,6 +119,27 @@ Consequences worth stating:
 - the comment is public HTML: it lists the machines this dashboard has seen. That is the
   same information the Machines row shows, plus timestamps.
 
+### The Resync button
+
+The page is a snapshot; the daemon keeps learning. **Resync with server** closes that gap
+without a restart: the button calls `/_splash/peers`, an endpoint served by `splash` itself
+that runs the same assembly as a regeneration (`live::collect`) and returns the cards it
+would draw.
+
+Two decisions worth noting:
+
+- **the endpoint returns rendered card HTML**, not fields. The button then inserts exactly
+  what the generator would have written — same tag, same escaping, same status classes —
+  so there is one renderer to keep correct instead of a Rust one and a JavaScript one that
+  drift apart.
+- **the page applies the same filters again** (URL already present, hostname is this
+  machine). The server filters self too, but a page can outlive the hostname it was built
+  with, and offering a link to the page you are looking at is the one mistake that is
+  obvious to the reader.
+
+The endpoint is absent when the page is served by anything else, and a failed request is
+silent: on a deployed page the button simply does what it always did.
+
 ### Failure modes
 
 - mDNS is layer 2. It does not cross a router, a VLAN boundary, or most VPNs — that is

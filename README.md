@@ -43,7 +43,10 @@ that actually matters for a LAN dashboard.
 
 **Resync.** A button re-probes the host for services that started since the page was
 generated. (A browser cannot enumerate ports, so it explores a list of ~140 common
-ones; anything else needs a refresh, which the container does on a timer.)
+ones; anything else needs a refresh, which the container does on a timer.) When `splash`
+is the one serving the page it also asks which *machines* it can see right now, so a
+peer that appeared after the page was built shows up immediately instead of waiting for
+the next regeneration.
 
 **Curation that survives regeneration.** Rename, re-icon, regroup or hide anything in
 `overrides.toml`. The generated HTML is never the source of truth, so regenerating
@@ -357,6 +360,12 @@ A remembered machine is shown with its age (`last seen 3h ago`) and a status lig
 whether it answered just now — and it doubles as a federation seed, so one machine that came
 back can pull the rest of the list in with it. That is what keeps the page useful on a
 network where multicast is filtered, or on a morning when every configured peer is asleep.
+
+The **Resync with server** button asks the same question on demand: `/_splash/peers`
+returns the cards the server can see at that moment, so a machine that appeared since the
+page was built shows up without a restart or a refresh. (That endpoint exists only when
+`splash` serves the page; deployed to nginx or Apache the button falls back to what the
+page was built with.)
 
 Three properties keep this from becoming a source of fiction:
 
